@@ -1,0 +1,97 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: mbox-lite
+    main: ./cmd/mbox
+    binary: mbox-lite
+    env:
+      - CGO_ENABLED=1
+    tags:
+      - nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,nobadger,noetcd,nocifs,notrace,nometrics,nos3
+    ldflags:
+      - -s -w -X github.com/revv00/mailfs/pkg/version.Revision={{.ShortCommit}} -X github.com/revv00/mailfs/pkg/version.RevisionDate={{.Date}}
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    hooks:
+      pre:
+        - id: windows-fuse-include
+          # This is a bit tricky since goreleaser-cross handles CC and CGO_CFLAGS.
+          # We might need to handle this in the GHA workflow or using specific env vars in builds if needed.
+          # For windows, the Makefile uses CGO_CFLAGS="-I$(DOCKER_WORKDIR)/include/fuse"
+          # goreleaser allows env overrides per build, but we can't easily distinguish windows-amd64 here without a separate build id or a matrix.
+    # We'll split builds if env needs to be significantly different.
+    # However, let's try a single build with conditional env if possible, 
+    # but Goreleaser builds list is usually better for different CGO requirements.
+
+  - id: mbox-lite-windows
+    main: ./cmd/mbox
+    binary: mbox-lite
+    env:
+      - CGO_ENABLED=1
+      # CC and CGO_CFLAGS will be provided by goreleaser-cross or the runner environment.
+      # But we can try to set them here if we know the architecture.
+      # For now, let's assume the GHA runner/container handles CC.
+      - CGO_CFLAGS="-I./include/fuse"
+    tags:
+      - nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,nobadger,noetcd,nocifs,notrace,nometrics,nos3
+    ldflags:
+      - -s -w -X github.com/revv00/mailfs/pkg/version.Revision={{.ShortCommit}} -X github.com/revv00/mailfs/pkg/version.RevisionDate={{.Date}}
+    goos:
+      - windows
+    goarch:
+      - amd64
+
+  - id: mbox-lite-unix
+    main: ./cmd/mbox
+    binary: mbox-lite
+    env:
+      - CGO_ENABLED=1
+    tags:
+      - nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,nobadger,noetcd,nocifs,notrace,nometrics,nos3
+    ldflags:
+      - -s -w -X github.com/revv00/mailfs/pkg/version.Revision={{.ShortCommit}} -X github.com/revv00/mailfs/pkg/version.RevisionDate={{.Date}}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    # use zip for windows archives
+    format_overrides:
+      - goos: windows
+        format: zip
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}{{ if .Mips }}_{{ .Mips }}{{ end }}{{ if .IsNightly }}_nightly{{ end }}
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+
+release:
+  github:
+    owner: revv00
+    name: mailfs
