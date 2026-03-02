@@ -15,6 +15,15 @@ If you have Go installed:
 go install github.com/revv00/mailfs/cmd/mbox@latest
 ```
 
+### Building from Source
+Use the provided `Makefile` for optimized builds:
+```bash
+make       # Standard build (stripped, ~74MB)
+make lite  # Optimized lite build (removes unused cloud drivers, ~25MB)
+make clean # Remove built binaries
+```
+The `mbox.lite` version is recommended for maximum portability as it removes heavy cloud SDKs (S3, GCS, Azure, etc.) while keeping full support for Email-based storage.
+
 For others, download the latest pre-built binary for your platform (Linux, macOS, Windows) from the [Releases](https://github.com/revv00/mailfs/releases) page.
 
 ---
