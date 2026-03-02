@@ -41,7 +41,7 @@ Upload a directory with a single copy of each chunk:
 # Enter Archive Password: ****
 ```
 - **Master Password**: To access your email for uploading.
-- **Archive Password**: To encrypt the resulting `my_folder.mbox`.
+- **Archive Password**: To encrypt the resulting `my_folder.mbox`, empty to reuse the Master Password.
 
 ### 3. Put (2× Replication – Redundant Backup)
 Upload a directory with double redundancy for safety:
@@ -59,7 +59,7 @@ Downloading or sharing is **completely self-contained**. To restore an `.mbox` f
 *Note: If the file isn't found locally, `mbox` can automatically search your cloud accounts. This is the **only** time it will ask for your local Master Password.*
 
 ### 5. Del (Delete)
-Remove a local stick file and optionally clean up remote blobs (future feature):
+Remove a local stick file and clean up all remote chunks (wipes data from cloud):
 ```bash
 ./mbox del my_folder.mbox
 ```

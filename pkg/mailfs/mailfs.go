@@ -1122,6 +1122,48 @@ func (m *MailFS) DownloadMBox(filename string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(cleanBlob.String())
 }
 
+// DeleteMBox deletes an encrypted .mbox file from the specified account.
+func (m *MailFS) DeleteMBox(filename string) error {
+	accountIdx := 0
+	safeClient, err := m.getIMAPClient(accountIdx)
+	if err != nil {
+		return err
+	}
+	defer safeClient.Unlock()
+
+	c := safeClient.c
+	_, err = c.Select("INBOX", false)
+	if err != nil {
+		return err
+	}
+
+	searchKey := "MBox Config: " + filename
+	seqNum, err := m.findMsgUIDClientSide(c, searchKey)
+	if err != nil {
+		return err
+	}
+	if seqNum == 0 {
+		return nil // Not found, treat as success
+	}
+
+	seqSet := new(imap.SeqSet)
+	seqSet.AddNum(seqNum)
+
+	item := imap.FormatFlagsOp(imap.AddFlags, true)
+	flags := []interface{}{imap.DeletedFlag}
+
+	if err := c.Store(seqSet, item, flags, nil); err != nil {
+		return fmt.Errorf("marking deleted failed: %w", err)
+	}
+
+	if err := c.Expunge(nil); err != nil {
+		return fmt.Errorf("expunge failed: %w", err)
+	}
+
+	logger.Infof("[DELETE] Successfully deleted config %s", filename)
+	return nil
+}
+
 func (m *MailFS) fetchFromEmail(accountIdx int, msgID string, key string) ([]byte, error) {
 	var email string
 	if accountIdx >= 0 && accountIdx < len(m.accounts) && m.accounts[accountIdx] != nil {
