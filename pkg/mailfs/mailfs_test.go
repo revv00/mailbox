@@ -472,8 +472,9 @@ func TestReplicationLogic(t *testing.T) {
 
 	// Create config with enough accounts for replication
 	cfg := config.MailFSConfig{
-		Accounts: make([]*config.MailAccount, 5),
-		DBPath:   dbPath,
+		Accounts:          make([]*config.MailAccount, 5),
+		DBPath:            dbPath,
+		ReplicationFactor: 2,
 	}
 	// Populate dummy accounts so validation passes
 	for i := range cfg.Accounts {

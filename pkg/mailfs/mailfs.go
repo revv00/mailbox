@@ -272,10 +272,26 @@ func (m *MailFS) initDB() error {
 }
 
 func (m *MailFS) initIMAPConnections() error {
+	for i, acc := range m.accounts {
+		// Initialize the safe client struct if nil
+		if m.imapClients[i] == nil {
+			m.imapClients[i] = &safeIMAPClient{}
+		}
+
+		c, err := m.connectIMAP(acc)
+		if err != nil {
+			logger.Warnf("Issues initializing IMAP connection for %s: %v", acc.Email, err)
+			continue
+		}
+		m.imapClients[i].c = c
+	}
+	return nil
+}
+
+func (m *MailFS) connectIMAP(acc *config.MailAccount) (*client.Client, error) {
 	skipVerify := os.Getenv("MAILFS_SKIP_TLS_VERIFY") == "1"
 
 	// Legacy CipherSuites required for older mail providers (Sina, 163, etc.)
-	// Go 1.18+ disables these by default, so we must explicitly enable them.
 	legacyCiphers := []uint16{
 		tls.TLS_RSA_WITH_AES_128_CBC_SHA,
 		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
@@ -285,87 +301,124 @@ func (m *MailFS) initIMAPConnections() error {
 		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 	}
 
-	for i, acc := range m.accounts {
-		logger.Debugf("[IMAP] Connecting to %s (%s)", acc.IMAPHost, acc.Email)
+	logger.Debugf("[IMAP] Connecting to %s (%s)", acc.IMAPHost, acc.Email)
 
-		host, port, err := net.SplitHostPort(acc.IMAPHost)
-		if err != nil {
-			host = acc.IMAPHost
-			port = "993"
-		}
-		addr := net.JoinHostPort(host, port)
-
-		tlsConfig := &tls.Config{
-			ServerName:         host,
-			InsecureSkipVerify: skipVerify,
-			MinVersion:         tls.VersionTLS10, // Support older servers
-			CipherSuites:       legacyCiphers,    // Enable RSA ciphers
-		}
-
-		var c *client.Client
-
-		// 1. Try Dialing with Implicit TLS (Usually port 993)
-		dialer := &net.Dialer{Timeout: 15 * time.Second}
-		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
-
-		if err != nil {
-			logger.Debugf("[IMAP] TLS handshake failed for %s: %v. Trying STARTTLS on port 143...", acc.Email, err)
-
-			// 2. Fallback to Port 143 + STARTTLS
-			plainAddr := net.JoinHostPort(host, "143")
-			plainConn, pErr := net.DialTimeout("tcp", plainAddr, 15*time.Second)
-			if pErr != nil {
-				logger.Warnf("[IMAP] Connection failed for %s on both 993 and 143", acc.Email)
-				continue
-			}
-
-			c, err = client.New(plainConn)
-			if err == nil {
-				err = c.StartTLS(tlsConfig)
-			}
-
-			if err != nil {
-				logger.Warnf("[IMAP] STARTTLS failed for %s: %v", acc.Email, err)
-				if c != nil {
-					c.Close()
-				}
-				continue
-			}
-		} else {
-			// Successfully connected via DialTLS
-			c, err = client.New(conn)
-			if err != nil {
-				logger.Warnf("[IMAP] Failed to create client for %s: %v", acc.Email, err)
-				conn.Close()
-				continue
-			}
-		}
-
-		// Login with Authorization Code (授权码)
-		if err := c.Login(acc.Email, acc.Password); err != nil {
-			c.Close()
-			logger.Warnf("[IMAP] Login failed for %s: %v. Check if using App Authorization Code.", acc.Email, err)
-			continue
-		}
-
-		// NetEase (163/126) and some others require ID command to avoid "Unsafe Login" error
-		// especially when Select is called later.
-		idCmd := &imapIDCommand{
-			Details: []interface{}{"name", "JuiceFS", "version", "1.0.0"},
-		}
-		if _, err := c.Execute(idCmd, nil); err != nil {
-			logger.Debugf("[IMAP] ID command failed for %s (might not be supported): %v", acc.Email, err)
-		}
-
-		// Ensure the storage folder exists
-		if err := c.Create(acc.Folder); err != nil {
-			// Folder might already exist
-		}
-
-		m.imapClients[i] = &safeIMAPClient{c: c}
-		logger.Infof("[IMAP] Successfully connected and logged in: %s", acc.Email)
+	host, port, err := net.SplitHostPort(acc.IMAPHost)
+	if err != nil {
+		host = acc.IMAPHost
+		port = "993"
 	}
-	return nil
+	addr := net.JoinHostPort(host, port)
+
+	tlsConfig := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: skipVerify,
+		MinVersion:         tls.VersionTLS10, // Support older servers
+		CipherSuites:       legacyCiphers,    // Enable RSA ciphers
+	}
+
+	var c *client.Client
+
+	// 1. Try Dialing with Implicit TLS (Usually port 993)
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
+
+	if err != nil {
+		logger.Debugf("[IMAP] TLS handshake failed for %s: %v. Trying STARTTLS on port 143...", acc.Email, err)
+
+		// 2. Fallback to Port 143 + STARTTLS
+		plainAddr := net.JoinHostPort(host, "143")
+		plainConn, pErr := net.DialTimeout("tcp", plainAddr, 15*time.Second)
+		if pErr != nil {
+			return nil, fmt.Errorf("connection failed on both 993 and 143: %w", pErr)
+		}
+
+		c, err = client.New(plainConn)
+		if err == nil {
+			err = c.StartTLS(tlsConfig)
+		}
+
+		if err != nil {
+			if c != nil {
+				c.Close()
+			}
+			return nil, fmt.Errorf("STARTTLS failed: %w", err)
+		}
+	} else {
+		// Successfully connected via DialTLS
+		c, err = client.New(conn)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create client: %w", err)
+		}
+	}
+
+	// Login with Authorization Code
+	if err := c.Login(acc.Email, acc.Password); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("login failed: %w", err)
+	}
+
+	// NetEase (163/126) and some others require ID command
+	idCmd := &imapIDCommand{
+		Details: []interface{}{"name", "JuiceFS", "version", "1.0.0"},
+	}
+	if _, err := c.Execute(idCmd, nil); err != nil {
+		logger.Debugf("[IMAP] ID command failed for %s (might not be supported): %v", acc.Email, err)
+	}
+
+	// Ensure the storage folder exists (optional, best effort)
+	if err := c.Create(acc.Folder); err != nil {
+		// Folder might already exist, ignore error
+	}
+
+	logger.Infof("[IMAP] Successfully connected and logged in: %s", acc.Email)
+	return c, nil
+}
+
+func (m *MailFS) getIMAPClient(accountIdx int) (*safeIMAPClient, error) {
+	if accountIdx < 0 || accountIdx >= len(m.imapClients) {
+		return nil, fmt.Errorf("invalid account index %d", accountIdx)
+	}
+
+	sc := m.imapClients[accountIdx]
+	if sc == nil {
+		// Should be initialized in initIMAPConnections, but double check
+		m.Lock() // Using m.Lock because we might modify the slice
+		if m.imapClients[accountIdx] == nil {
+			m.imapClients[accountIdx] = &safeIMAPClient{}
+		}
+		sc = m.imapClients[accountIdx]
+		m.Unlock()
+	}
+
+	sc.Lock()
+	// Check if already connected and alive
+	if sc.c != nil {
+		// Perform a NOOP to check connection health
+		if err := sc.c.Noop(); err == nil {
+			return sc, nil
+		}
+		logger.Warnf("[IMAP] Connection lost for account %d, reconnecting...", accountIdx)
+		// Connection lost, close explicitly
+		_ = sc.c.Logout()
+		sc.c = nil
+	}
+
+	// Reconnect
+	if accountIdx >= len(m.accounts) {
+		sc.Unlock()
+		return nil, fmt.Errorf("account config missing for index %d", accountIdx)
+	}
+	acc := m.accounts[accountIdx]
+	c, err := m.connectIMAP(acc)
+	if err != nil {
+		sc.Unlock()
+		return nil, fmt.Errorf("[IMAP] Reconnect failed for %s: %w", acc.Email, err)
+	}
+
+	sc.c = c
+	return sc, nil
 }
 
 func (m *MailFS) String() string {
@@ -873,12 +926,10 @@ func (m *MailFS) storeGenericFile(subject string, filename string, data []byte) 
 func (m *MailFS) ListMBoxes(pattern string) ([]string, error) {
 	// Using account 0 for config storage
 	accountIdx := 0
-	if accountIdx >= len(m.imapClients) || m.imapClients[accountIdx] == nil {
-		return nil, errors.New("IMAP client not initialized")
+	safeClient, err := m.getIMAPClient(accountIdx)
+	if err != nil {
+		return nil, err
 	}
-
-	safeClient := m.imapClients[accountIdx]
-	safeClient.Lock()
 	defer safeClient.Unlock()
 
 	c := safeClient.c
@@ -948,16 +999,14 @@ func (m *MailFS) ListMBoxes(pattern string) ([]string, error) {
 // DownloadMBox downloads an encrypted .mbox file from the specified account.
 func (m *MailFS) DownloadMBox(filename string) ([]byte, error) {
 	accountIdx := 0
-	if accountIdx >= len(m.imapClients) || m.imapClients[accountIdx] == nil {
-		return nil, errors.New("IMAP client not initialized")
+	safeClient, err := m.getIMAPClient(accountIdx)
+	if err != nil {
+		return nil, err
 	}
-
-	safeClient := m.imapClients[accountIdx]
-	safeClient.Lock()
 	defer safeClient.Unlock()
 
 	c := safeClient.c
-	_, err := c.Select("INBOX", false)
+	_, err = c.Select("INBOX", false)
 	if err != nil {
 		return nil, err
 	}
@@ -1026,13 +1075,10 @@ func (m *MailFS) fetchFromEmail(accountIdx int, msgID string, key string) ([]byt
 		email = "invalid-account"
 	}
 	logger.Infof("[MailFS] fetchFromEmail: key=%s, msgID=%s, account=%d, %s", key, msgID, accountIdx, email)
-	if accountIdx >= len(m.imapClients) || m.imapClients[accountIdx] == nil {
-		return nil, errors.New("IMAP client not initialized")
+	safeClient, clientErr := m.getIMAPClient(accountIdx)
+	if clientErr != nil {
+		return nil, fmt.Errorf("getIMAPClient: %w", clientErr)
 	}
-
-	safeClient := m.imapClients[accountIdx]
-
-	safeClient.Lock()
 	defer safeClient.Unlock()
 
 	c := safeClient.c
@@ -1491,10 +1537,11 @@ func (m *MailFS) Delete(key string, getters ...object.AttrGetter) error {
 
 		// Run deletion for this account
 		err := func(accIdx int, targetMsgID string) error {
-			safeClient := m.imapClients[accIdx]
+			safeClient, err := m.getIMAPClient(accIdx)
+			if err != nil {
+				return err
+			}
 			acc := m.accounts[accIdx]
-
-			safeClient.Lock()
 			defer safeClient.Unlock()
 
 			c := safeClient.c
