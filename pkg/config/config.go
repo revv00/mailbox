@@ -117,21 +117,30 @@ type AccountConfig struct {
 	Folder   string `json:"folder,omitempty"`
 }
 
-// LoadAccountsFromJSON loads email accounts from JSON file
-func LoadAccountsFromJSON(filePath string) ([]*MailAccount, error) {
+// ParsedConfig holds accounts and global settings
+type ParsedConfig struct {
+	Accounts    []*MailAccount
+	Replication int
+}
+
+// LoadAccountsFromJSON loads email accounts and global settings from JSON file
+func LoadAccountsFromJSON(filePath string) (*ParsedConfig, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
 	var configs []AccountConfig
+	var replication int
 
 	// Try parsing as object with "accounts" key
 	var wrapper struct {
-		Accounts []AccountConfig `json:"accounts"`
+		Accounts    []AccountConfig `json:"accounts"`
+		Replication int             `json:"replication"`
 	}
 	if err := json.Unmarshal(data, &wrapper); err == nil && len(wrapper.Accounts) > 0 {
 		configs = wrapper.Accounts
+		replication = wrapper.Replication
 	} else {
 		// Fallback to array of configs (old format)
 		if err := json.Unmarshal(data, &configs); err != nil {
@@ -148,15 +157,11 @@ func LoadAccountsFromJSON(filePath string) ([]*MailAccount, error) {
 		accounts = append(accounts, acc)
 	}
 
-	if len(accounts) == 0 {
-		return nil, fmt.Errorf("no valid accounts found in config")
-	}
-
-	return accounts, nil
+	return &ParsedConfig{Accounts: accounts, Replication: replication}, nil
 }
 
-// LoadAccountsFromEncryptedJSON loads email accounts from an encrypted JSON file
-func LoadAccountsFromEncryptedJSON(filePath string, password string) ([]*MailAccount, error) {
+// LoadAccountsFromEncryptedJSON loads email accounts and global settings from an encrypted JSON file
+func LoadAccountsFromEncryptedJSON(filePath string, password string) (*ParsedConfig, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
@@ -169,11 +174,14 @@ func LoadAccountsFromEncryptedJSON(filePath string, password string) ([]*MailAcc
 	}
 
 	var configs []AccountConfig
+	var replication int
 	var wrapper struct {
-		Accounts []AccountConfig `json:"accounts"`
+		Accounts    []AccountConfig `json:"accounts"`
+		Replication int             `json:"replication"`
 	}
 	if err := json.Unmarshal(decrypted, &wrapper); err == nil && len(wrapper.Accounts) > 0 {
 		configs = wrapper.Accounts
+		replication = wrapper.Replication
 	} else {
 		if err := json.Unmarshal(decrypted, &configs); err != nil {
 			return nil, fmt.Errorf("failed to parse decrypted JSON: %w", err)
@@ -189,11 +197,11 @@ func LoadAccountsFromEncryptedJSON(filePath string, password string) ([]*MailAcc
 		accounts = append(accounts, acc)
 	}
 
-	return accounts, nil
+	return &ParsedConfig{Accounts: accounts, Replication: replication}, nil
 }
 
 // SaveAccountsEncrypted saves accounts to a file encrypted with a password
-func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, password string) error {
+func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, replication int, password string) error {
 	configs := make([]AccountConfig, len(accounts))
 	for i, acc := range accounts {
 		configs[i] = AccountConfig{
@@ -205,7 +213,15 @@ func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, password st
 		}
 	}
 
-	data, err := json.MarshalIndent(configs, "", "  ")
+	wrapper := struct {
+		Accounts    []AccountConfig `json:"accounts"`
+		Replication int             `json:"replication,omitempty"`
+	}{
+		Accounts:    configs,
+		Replication: replication,
+	}
+
+	data, err := json.MarshalIndent(wrapper, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -219,7 +235,7 @@ func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, password st
 }
 
 // SerializeAccounts serializes accounts to JSON bytes (for portable archives)
-func SerializeAccounts(accounts []*MailAccount) ([]byte, error) {
+func SerializeAccounts(accounts []*MailAccount, replication int) ([]byte, error) {
 	configs := make([]AccountConfig, len(accounts))
 	for i, acc := range accounts {
 		configs[i] = AccountConfig{
@@ -230,7 +246,14 @@ func SerializeAccounts(accounts []*MailAccount) ([]byte, error) {
 			Folder:   acc.Folder,
 		}
 	}
-	return json.MarshalIndent(configs, "", "  ")
+	wrapper := struct {
+		Accounts    []AccountConfig `json:"accounts"`
+		Replication int             `json:"replication,omitempty"`
+	}{
+		Accounts:    configs,
+		Replication: replication,
+	}
+	return json.MarshalIndent(wrapper, "", "  ")
 }
 
 // IsEncrypted checks if the file at filePath is likely encrypted

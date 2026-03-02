@@ -129,14 +129,15 @@ func init() {
 			return nil, fmt.Errorf("load mailfs accounts: %s", err)
 		}
 
-		if err := config.ValidateAccounts(accounts); err != nil {
+		if err := config.ValidateAccounts(accounts.Accounts); err != nil {
 			return nil, fmt.Errorf("validate accounts: %s", err)
 		}
 
 		cfg := config.MailFSConfig{
-			Accounts:   accounts,
-			DBPath:     "mailfs-metadata.db",
-			BlobFolder: "juicefs-blobs",
+			Accounts:          accounts.Accounts,
+			DBPath:            "mailfs-metadata.db",
+			BlobFolder:        "juicefs-blobs",
+			ReplicationFactor: accounts.Replication,
 		}
 
 		return NewMailFS(cfg)
@@ -369,7 +370,7 @@ func (m *MailFS) Limits() object.Limits {
 		IsSupportMultipartUpload: false,
 		IsSupportUploadPartCopy:  false,
 		MinPartSize:              1024,
-		MaxPartSize:              20 * 1024 * 1024,
+		MaxPartSize:              32 * 1024 * 1024,
 	}
 }
 
@@ -398,7 +399,7 @@ func (m *MailFS) getReplicaAccounts(key string) (int, int) {
 	}
 
 	primary := hashToAccount(key, numAccounts)
-	if numAccounts == 1 {
+	if m.config.ReplicationFactor <= 1 || numAccounts == 1 {
 		return primary, primary
 	}
 
@@ -601,6 +602,9 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 		return "", fmt.Errorf("invalid account index %d", accountIdx)
 	}
 	acc := m.accounts[accountIdx]
+	emailErr := func(msg string, err error) error {
+		return fmt.Errorf("[Acc: %s] %s: %w", acc.Email, msg, err)
+	}
 
 	host, port, err := net.SplitHostPort(acc.SMTPHost)
 	if err != nil {
@@ -626,29 +630,35 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 	}
 
 	var c *smtp.Client
-	// 1. If port is 465, use Implicit SSL (tls.Dial)
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	// 1. If port is 465, use Implicit SSL
 	if port == "465" {
 		logger.Debugf("[SMTP] Using Implicit SSL for port 465")
-		conn, err := tls.Dial("tcp", addr, tlsConfig)
+		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
 		if err != nil {
-			return "", fmt.Errorf("SMTP DialTLS failed: %w", err)
+			return "", emailErr("SMTP DialTLS failed", err)
 		}
 		c, err = smtp.NewClient(conn, host)
 		if err != nil {
 			conn.Close()
-			return "", fmt.Errorf("SMTP NewClient failed: %w", err)
+			return "", emailErr("SMTP NewClient failed", err)
 		}
 	} else {
 		// 2. Use Plain connection + STARTTLS (Port 587/25)
 		logger.Debugf("[SMTP] Using STARTTLS for port %s", port)
-		c, err = smtp.Dial(addr)
+		conn, err := dialer.Dial("tcp", addr)
 		if err != nil {
-			return "", fmt.Errorf("SMTP Dial failed: %w", err)
+			return "", emailErr("SMTP Dial failed", err)
+		}
+		c, err = smtp.NewClient(conn, host)
+		if err != nil {
+			conn.Close()
+			return "", emailErr("SMTP NewClient failed", err)
 		}
 		if ok, _ := c.Extension("STARTTLS"); ok {
 			if err = c.StartTLS(tlsConfig); err != nil {
 				c.Close()
-				return "", fmt.Errorf("SMTP STARTTLS failed: %w", err)
+				return "", emailErr("SMTP STARTTLS failed", err)
 			}
 		}
 	}
@@ -658,7 +668,7 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 	logger.Debugf("[SMTP] Authenticating %s...", acc.Email)
 	auth := smtp.PlainAuth("", acc.Email, acc.Password, host)
 	if err = c.Auth(auth); err != nil {
-		return "", fmt.Errorf("SMTP Auth failed: %w", err)
+		return "", emailErr("SMTP Auth failed", err)
 	}
 
 	// 4. Construct Content
@@ -691,27 +701,27 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 	// 5. Send Data
 	logger.Debugf("[SMTP] Sending MAIL FROM...")
 	if err = c.Mail(acc.Email); err != nil {
-		return "", fmt.Errorf("MAIL FROM failed: %w", err)
+		return "", emailErr("MAIL FROM failed", err)
 	}
 
 	logger.Debugf("[SMTP] Sending RCPT TO...")
 	if err = c.Rcpt(acc.Email); err != nil {
-		return "", fmt.Errorf("RCPT TO failed: %w", err)
+		return "", emailErr("RCPT TO failed", err)
 	}
 
 	logger.Debugf("[SMTP] Sending DATA...")
 	w, err := c.Data()
 	if err != nil {
-		return "", fmt.Errorf("DATA command failed: %w", err)
+		return "", emailErr("DATA command failed", err)
 	}
 
 	if _, err = w.Write(body.Bytes()); err != nil {
 		w.Close()
-		return "", fmt.Errorf("writing body failed: %w", err)
+		return "", emailErr("writing body failed", err)
 	}
 
 	if err = w.Close(); err != nil {
-		return "", fmt.Errorf("closing data writer failed: %w", err)
+		return "", emailErr("closing data writer failed", err)
 	}
 
 	logger.Infof("[SMTP] Successfully stored blob %s in email (MsgID: %s)", key, msgID)
