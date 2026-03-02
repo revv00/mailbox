@@ -234,9 +234,12 @@ func NewMailFS(cfg config.MailFSConfig) (*MailFS, error) {
 	}
 
 	// Initialize IMAP connections
-	if err := mfs.initIMAPConnections(); err != nil {
-		logger.Warnf("Issues initializing IMAP connections: %v", err)
-	}
+	// Disabled eager initialization to allow lazy connection.
+	// This ensures commands like `mbox ls` only connect to the first account,
+	// and speeds up startup for all commands.
+	// if err := mfs.initIMAPConnections(); err != nil {
+	// 	logger.Warnf("Issues initializing IMAP connections: %v", err)
+	// }
 
 	logger.Infof("MailFS initialized with %d email accounts", len(mfs.config.Accounts))
 	return mfs, nil

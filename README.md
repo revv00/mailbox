@@ -64,6 +64,15 @@ Remove a local stick file and optionally clean up remote blobs (future feature):
 ./mbox del my_folder.mbox
 ```
 
+### 6. Ls (List)
+List all available `.mbox` files stored in your cloud storage (checks the first configured account):
+```bash
+./mbox ls
+# Scanning first mail account for .mbox files...
+# MBox Config: project_v1.mbox
+# ...
+```
+
 ---
 
 ## 🚀 Design Philosophy
@@ -79,7 +88,6 @@ The core philosophy of `mbox` is **Extreme Conciseness**. While traditional dist
 
 ### 1. "USB Stick" File Transfer
 Forget slow uploads to generic cloud drives or hunting for a physical thumb drive.
-- Pack your files into an encrypted `.mbox` stick.
 - Pack your files into an encrypted `.mbox` stick.
 - **Cloud-Enable**: The `.mbox` is automatically stashed in your email.
 - **Zero-File Sharing**: Tell the recipient the filename (e.g., `project_v1.mbox`) and password. They run `mbox get project_v1.mbox`, and it pulls everything from the cloud—no need to actually send the file!
@@ -101,6 +109,7 @@ Ideal for documents, source code repositories, or configuration sets.
 | `mbox stash` | `format` → `mount` → `cp` → `pack` | 1× replication upload; creates `.mbox` file. |
 | `mbox put` | `format` → `mount` → `cp` → `pack` | 2× replication upload; creates `.mbox` file. |
 | `mbox get` | `unpack` → `mount` → `cp` | Decrypts `.mbox` and restores data locally. |
+| `mbox ls` | `imap search` | Lists .mbox files found in the cloud (first account). |
 | `mbox del` | `rm` + `blob cleanup` | Conceptually wipes local and remote data. |
 
 ---
