@@ -213,7 +213,7 @@ require (
 	gopkg.in/kothar/go-backblaze.v0 v0.0.0-20210124194846-35409b867216 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
-	modernc.org/fileutil v1.0.0 // indirect
+	modernc.org/fileutil v1.3.0 // indirect
 	xorm.io/builder v0.3.7 // indirect
 	xorm.io/xorm v1.0.7 // indirect
 )
