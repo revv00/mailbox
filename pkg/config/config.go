@@ -52,6 +52,7 @@ type MailFSConfig struct {
 	BlobFolder        string // Folder prefix for blobs in email
 	ReplicationFactor int    // Number of replicas per chunk
 	NoCache           bool   // If true, data is not stored in local DB
+	SubjectPrefix     string // Prefix for email subjects
 }
 
 // MailProvider represents common email providers with preset configurations
@@ -119,8 +120,9 @@ type AccountConfig struct {
 
 // ParsedConfig holds accounts and global settings
 type ParsedConfig struct {
-	Accounts    []*MailAccount
-	Replication int
+	Accounts      []*MailAccount
+	Replication   int
+	SubjectPrefix string
 }
 
 // LoadAccountsFromJSON loads email accounts and global settings from JSON file
@@ -135,17 +137,23 @@ func LoadAccountsFromJSON(filePath string) (*ParsedConfig, error) {
 
 	// Try parsing as object with "accounts" key
 	var wrapper struct {
-		Accounts    []AccountConfig `json:"accounts"`
-		Replication int             `json:"replication"`
+		Accounts      []AccountConfig `json:"accounts"`
+		Replication   int             `json:"replication"`
+		SubjectPrefix string          `json:"subject_prefix"`
 	}
 	if err := json.Unmarshal(data, &wrapper); err == nil && len(wrapper.Accounts) > 0 {
 		configs = wrapper.Accounts
 		replication = wrapper.Replication
+		if wrapper.SubjectPrefix == "" {
+			wrapper.SubjectPrefix = "MBOX Blob :"
+		}
 	} else {
 		// Fallback to array of configs (old format)
 		if err := json.Unmarshal(data, &configs); err != nil {
 			return nil, fmt.Errorf("failed to parse JSON: %w", err)
 		}
+		// Default for old array format
+		wrapper.SubjectPrefix = "MBOX Blob :"
 	}
 
 	var accounts []*MailAccount
@@ -157,7 +165,11 @@ func LoadAccountsFromJSON(filePath string) (*ParsedConfig, error) {
 		accounts = append(accounts, acc)
 	}
 
-	return &ParsedConfig{Accounts: accounts, Replication: replication}, nil
+	return &ParsedConfig{
+		Accounts:      accounts,
+		Replication:   replication,
+		SubjectPrefix: wrapper.SubjectPrefix,
+	}, nil
 }
 
 // LoadAccountsFromEncryptedJSON loads email accounts and global settings from an encrypted JSON file
@@ -176,16 +188,21 @@ func LoadAccountsFromEncryptedJSON(filePath string, password string) (*ParsedCon
 	var configs []AccountConfig
 	var replication int
 	var wrapper struct {
-		Accounts    []AccountConfig `json:"accounts"`
-		Replication int             `json:"replication"`
+		Accounts      []AccountConfig `json:"accounts"`
+		Replication   int             `json:"replication"`
+		SubjectPrefix string          `json:"subject_prefix"`
 	}
 	if err := json.Unmarshal(decrypted, &wrapper); err == nil && len(wrapper.Accounts) > 0 {
 		configs = wrapper.Accounts
 		replication = wrapper.Replication
+		if wrapper.SubjectPrefix == "" {
+			wrapper.SubjectPrefix = "MBOX Blob :"
+		}
 	} else {
 		if err := json.Unmarshal(decrypted, &configs); err != nil {
 			return nil, fmt.Errorf("failed to parse decrypted JSON: %w", err)
 		}
+		wrapper.SubjectPrefix = "MBOX Blob :"
 	}
 
 	var accounts []*MailAccount
@@ -197,7 +214,11 @@ func LoadAccountsFromEncryptedJSON(filePath string, password string) (*ParsedCon
 		accounts = append(accounts, acc)
 	}
 
-	return &ParsedConfig{Accounts: accounts, Replication: replication}, nil
+	return &ParsedConfig{
+		Accounts:      accounts,
+		Replication:   replication,
+		SubjectPrefix: wrapper.SubjectPrefix,
+	}, nil
 }
 
 // SaveAccountsEncrypted saves accounts to a file encrypted with a password
@@ -214,11 +235,13 @@ func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, replication
 	}
 
 	wrapper := struct {
-		Accounts    []AccountConfig `json:"accounts"`
-		Replication int             `json:"replication,omitempty"`
+		Accounts      []AccountConfig `json:"accounts"`
+		Replication   int             `json:"replication,omitempty"`
+		SubjectPrefix string          `json:"subject_prefix,omitempty"`
 	}{
-		Accounts:    configs,
-		Replication: replication,
+		Accounts:      configs,
+		Replication:   replication,
+		SubjectPrefix: "MBOX Blob :", // Default for new configs
 	}
 
 	data, err := json.MarshalIndent(wrapper, "", "  ")
@@ -335,7 +358,17 @@ func GenerateConfigTemplate(w io.Writer, numAccounts int) error {
 		}
 	}
 
-	data, err := json.MarshalIndent(configs, "", "  ")
+	wrapper := struct {
+		Accounts      []AccountConfig `json:"accounts"`
+		Replication   int             `json:"replication"`
+		SubjectPrefix string          `json:"subject_prefix"`
+	}{
+		Accounts:      configs,
+		Replication:   2,
+		SubjectPrefix: "MBOX Blob :",
+	}
+
+	data, err := json.MarshalIndent(wrapper, "", "  ")
 	if err != nil {
 		return err
 	}

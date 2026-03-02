@@ -138,6 +138,7 @@ func init() {
 			DBPath:            "mailfs-metadata.db",
 			BlobFolder:        "juicefs-blobs",
 			ReplicationFactor: accounts.Replication,
+			SubjectPrefix:     accounts.SubjectPrefix,
 		}
 
 		return NewMailFS(cfg)
@@ -813,7 +814,7 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 
 	// 4. Construct Content
 	boundary := fmt.Sprintf("JUICEFS_BOUNDARY_%d", time.Now().UnixNano())
-	subject := fmt.Sprintf("JuiceFS Blob :%s", key)
+	subject := fmt.Sprintf("%s%s", m.config.SubjectPrefix, key)
 	// Generate a realistic Message-ID using the account domain
 	domain := getDomain(acc.Email)
 	msgID := fmt.Sprintf("<juicefs-%s-%d@%s>", key, time.Now().UnixNano(), domain)
@@ -831,7 +832,7 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 
 	body.WriteString("--" + boundary + "\r\n")
 	body.WriteString("Content-Type: text/plain; charset=utf-8\r\n\r\n")
-	body.WriteString("JuiceFS Blob Attachment\r\n")
+	body.WriteString(m.config.SubjectPrefix + " Attachment\r\n")
 
 	body.WriteString("--" + boundary + "\r\n")
 	body.WriteString("Content-Type: application/octet-stream\r\n")
@@ -1288,10 +1289,21 @@ func (m *MailFS) findMsgUID(c *client.Client, key string) (uint32, error) {
 		// Fallback code would go here
 	}
 
-	// 3. Fallback: If 0 results, search for broad "JuiceFS" string
+	// 3. Fallback: Search for configured prefix, and then "JuiceFS" for legacy compatibility
 	if len(ids) == 0 {
-		ids, err = m.rawSearchSubject(c, "JuiceFS")
-		if err != nil {
+		searchTerm := strings.TrimSpace(strings.ReplaceAll(m.config.SubjectPrefix, ":", ""))
+		if searchTerm == "" {
+			searchTerm = "JuiceFS"
+		}
+		ids, err = m.rawSearchSubject(c, searchTerm)
+
+		// If new prefix yielded no results, try legacy "JuiceFS"
+		if len(ids) == 0 && !strings.EqualFold(searchTerm, "JuiceFS") {
+			legacyIds, _ := m.rawSearchSubject(c, "JuiceFS")
+			ids = append(ids, legacyIds...)
+		}
+
+		if err != nil && len(ids) == 0 {
 			logger.Warnf("Broad search failed: %v", err)
 		}
 	}
@@ -1390,7 +1402,7 @@ func (m *MailFS) findMsgUIDClientSide0(c *client.Client, key string) (uint32, er
 		}
 
 		// Check the Subject string.
-		// Since you save blobs as "JuiceFS Blob :<key>", checking for the key here is safe.
+		// Since you save blobs as "<prefix><key>", checking for the key here is safe.
 		// strings.Contains is fast and avoids all server-side tokenization issues.
 		// logger.Infof("Checking message SeqNum %d with msg: %v", msg.SeqNum, msg)
 		if strings.Contains(msg.Envelope.Subject, key) {
