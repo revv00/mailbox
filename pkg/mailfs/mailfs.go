@@ -487,6 +487,49 @@ func (m *MailFS) getReplicaAccounts(key string) (int, int) {
 	return primary, replica
 }
 
+// findBlobInCloud searches for a blob in the specified account and returns its Message-ID if found.
+func (m *MailFS) findBlobInCloud(accountIdx int, key string) (string, error) {
+	safeClient, err := m.getIMAPClient(accountIdx)
+	if err != nil {
+		return "", err
+	}
+	// Note: getIMAPClient returns a locked client, but we should ensure we hold it.
+	// Actually getIMAPClient in this codebase is a bit inconsistent.
+	// Looking at WipeAllCloudData, it calls defer safeClient.Unlock().
+	// So we assume getIMAPClient returns a locked client.
+	defer safeClient.Unlock()
+
+	c := safeClient.c
+	_, err = c.Select("INBOX", true)
+	if err != nil {
+		return "", err
+	}
+
+	uids, err := m.rawSearchSubject(c, m.config.SubjectPrefix+key)
+	if err != nil || len(uids) == 0 {
+		return "", err
+	}
+
+	// Fetch Envelope for the latest one to get Message-ID
+	seqSet := new(imap.SeqSet)
+	seqSet.AddNum(uids[len(uids)-1])
+	messages := make(chan *imap.Message, 1)
+
+	// Fetch in background to handle channel
+	go func() {
+		if err := c.Fetch(seqSet, []imap.FetchItem{imap.FetchEnvelope}, messages); err != nil {
+			logger.Warnf("Fetch envelope failed for %d: %v", uids[len(uids)-1], err)
+		}
+		close(messages)
+	}()
+
+	msg := <-messages
+	if msg != nil && msg.Envelope != nil {
+		return msg.Envelope.MessageId, nil
+	}
+	return "", nil
+}
+
 func (m *MailFS) lockAccounts(indices ...int) func() {
 	var sorted []int
 	unique := make(map[int]bool)
@@ -669,6 +712,12 @@ func (m *MailFS) readRange(data []byte, off, limit int64) io.ReadCloser {
 }
 
 func (m *MailFS) storeWithRetry(initialIdx int, otherIdx int, key string, data []byte) (int, string, error) {
+	// 0. Check if it already exists in the cloud for this account
+	if mid, err := m.findBlobInCloud(initialIdx, key); err == nil && mid != "" {
+		logger.Infof("[MailFS] Found existing blob %s in account %d, skipping upload", key, initialIdx)
+		return initialIdx, mid, nil
+	}
+
 	// 1. Try initialIdx
 	msgID, err := func() (string, error) {
 		unlock := m.lockAccounts(initialIdx)
@@ -737,6 +786,14 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 	data, err := io.ReadAll(in)
 	if err != nil {
 		return err
+	}
+
+	// 0. Check local database first (handles retries within the same run)
+	var existingMsgID string
+	err = m.db.QueryRow("SELECT msg_id FROM blobs WHERE key = ?", key).Scan(&existingMsgID)
+	if err == nil && existingMsgID != "" {
+		logger.Infof("[MailFS] Blob %s already exists in database, skipping upload", key)
+		return nil
 	}
 
 	primaryIdx, replicaIdx := m.getReplicaAccounts(key)
