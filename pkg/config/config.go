@@ -47,12 +47,13 @@ func (m *MailAccount) Unlock() {
 
 // MailFSConfig holds configuration for mailfs
 type MailFSConfig struct {
-	Accounts          []*MailAccount
-	DBPath            string // SQLite database path for metadata
-	BlobFolder        string // Folder prefix for blobs in email
-	ReplicationFactor int    // Number of replicas per chunk
-	NoCache           bool   // If true, data is not stored in local DB
-	SubjectPrefix     string // Prefix for email subjects
+	Accounts           []*MailAccount
+	DBPath             string // SQLite database path for metadata
+	BlobFolder         string // Folder prefix for blobs in email
+	ReplicationFactor  int    // Number of replicas per chunk
+	NoCache            bool   // If true, data is not stored in local DB
+	SubjectPrefix      string // Prefix for email subjects
+	ParallelByProvider bool   // If true, limit concurrency per email provider
 }
 
 // MailProvider represents common email providers with preset configurations
@@ -74,7 +75,8 @@ var Providers = map[string]MailProvider{
 	"outlook": {
 		Name:     "Outlook",
 		IMAPHost: "outlook.office365.com:993",
-		SMTPHost: "smtp.office365.com:587",
+		// SMTPHost: "smtp.office365.com:587",
+		SMTPHost: "smtp-mail.outlook.com:587",
 	},
 	"yahoo": {
 		Name:     "Yahoo",
@@ -120,9 +122,10 @@ type AccountConfig struct {
 
 // ParsedConfig holds accounts and global settings
 type ParsedConfig struct {
-	Accounts      []*MailAccount
-	Replication   int
-	SubjectPrefix string
+	Accounts           []*MailAccount
+	Replication        int
+	SubjectPrefix      string
+	ParallelByProvider bool
 }
 
 // LoadAccountsFromJSON loads email accounts and global settings from JSON file
@@ -382,8 +385,8 @@ func ValidateAccounts(accounts []*MailAccount) error {
 	if len(accounts) == 0 {
 		return fmt.Errorf("at least one email account is required")
 	}
-	if len(accounts) > 10 {
-		return fmt.Errorf("maximum 10 accounts supported (got %d)", len(accounts))
+	if len(accounts) > 20 {
+		return fmt.Errorf("maximum 20 accounts supported (got %d)", len(accounts))
 	}
 
 	emailSet := make(map[string]bool)

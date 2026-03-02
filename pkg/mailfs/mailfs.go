@@ -195,6 +195,9 @@ type MailFS struct {
 	smtpClients []*safeSMTPClient
 	blobCache   map[string]*mailBlob // in-memory hot cache
 	wg          sync.WaitGroup       // track active operations
+
+	hostLocks   map[string]*sync.Mutex
+	hostLocksMu sync.Mutex
 }
 
 // NewMailFS creates a new mailFS instance
@@ -227,6 +230,7 @@ func NewMailFS(cfg config.MailFSConfig) (*MailFS, error) {
 		imapClients: make([]*safeIMAPClient, len(cfg.Accounts)),
 		smtpClients: make([]*safeSMTPClient, len(cfg.Accounts)),
 		blobCache:   make(map[string]*mailBlob),
+		hostLocks:   make(map[string]*sync.Mutex),
 	}
 
 	if err := mfs.initDB(); err != nil {
@@ -494,6 +498,36 @@ func (m *MailFS) lockAccounts(indices ...int) func() {
 	}
 	sort.Ints(sorted)
 
+	var hosts []string
+	if m.config.ParallelByProvider {
+		uniqueHosts := make(map[string]bool)
+		for _, idx := range sorted {
+			acc := m.accounts[idx]
+			// Extract host from SMTPHost (could also use IMAPHost, they usually share same provider policy)
+			host, _, _ := net.SplitHostPort(acc.SMTPHost)
+			if host == "" {
+				host = acc.SMTPHost
+			}
+			if host != "" && !uniqueHosts[host] {
+				uniqueHosts[host] = true
+				hosts = append(hosts, host)
+			}
+		}
+		sort.Strings(hosts)
+
+		m.hostLocksMu.Lock()
+		for _, h := range hosts {
+			if _, ok := m.hostLocks[h]; !ok {
+				m.hostLocks[h] = &sync.Mutex{}
+			}
+		}
+		m.hostLocksMu.Unlock()
+
+		for _, h := range hosts {
+			m.hostLocks[h].Lock()
+		}
+	}
+
 	for _, idx := range sorted {
 		m.accounts[idx].Lock() // Lock the MailAccount value
 	}
@@ -501,6 +535,11 @@ func (m *MailFS) lockAccounts(indices ...int) func() {
 	return func() {
 		for i := len(sorted) - 1; i >= 0; i-- {
 			m.accounts[sorted[i]].Unlock() // Unlock the MailAccount value
+		}
+		if m.config.ParallelByProvider {
+			for i := len(hosts) - 1; i >= 0; i-- {
+				m.hostLocks[hosts[i]].Unlock()
+			}
 		}
 	}
 }
@@ -630,6 +669,7 @@ func (m *MailFS) readRange(data []byte, off, limit int64) io.ReadCloser {
 }
 
 func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) error {
+	logger.Infof("[MailFS] Put start: %s", key)
 	m.wg.Add(1)
 	defer m.wg.Done()
 	if key == "" {
@@ -647,21 +687,32 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 	unlock := m.lockAccounts(primaryIdx, replicaIdx)
 	defer unlock()
 
-	// 1. Upload to Email (Primary)
-	msgID, err := m.storeInEmail(primaryIdx, key, data)
-	if err != nil {
-		return fmt.Errorf("failed to store primary replica: %w", err)
+	// 1 & 2. Upload to Email (Primary and Replica in Parallel)
+	var msgID, replicaMsgID string
+	var pErr, rErr error
+	var uploadWg sync.WaitGroup
+
+	uploadWg.Add(1)
+	go func() {
+		defer uploadWg.Done()
+		msgID, pErr = m.storeInEmail(primaryIdx, key, data)
+	}()
+
+	if replicaIdx != primaryIdx {
+		uploadWg.Add(1)
+		go func() {
+			defer uploadWg.Done()
+			replicaMsgID, rErr = m.storeInEmail(replicaIdx, key, data)
+		}()
 	}
 
-	// 2. Upload to Email (Replica) - Best effort
-	var replicaMsgID string
-	if replicaIdx != primaryIdx {
-		rid, rErr := m.storeInEmail(replicaIdx, key, data)
-		if rErr != nil {
-			logger.Warnf("Replica upload failed for %s: %v", key, rErr)
-		} else {
-			replicaMsgID = rid
-		}
+	uploadWg.Wait()
+
+	if pErr != nil {
+		return fmt.Errorf("failed to store primary replica: %w", pErr)
+	}
+	if rErr != nil {
+		logger.Warnf("Replica upload failed for %s: %v", key, rErr)
 	}
 
 	// 3. Update Database (Metadata + Hot Cache)
@@ -714,30 +765,7 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 
 	return nil
 }
-func (m *MailFS) getSMTPClient(accountIdx int) (*safeSMTPClient, error) {
-	if accountIdx >= len(m.smtpClients) {
-		return nil, fmt.Errorf("invalid account index %d", accountIdx)
-	}
-
-	acc := m.accounts[accountIdx]
-	sc := m.smtpClients[accountIdx]
-	if sc == nil {
-		sc = &safeSMTPClient{}
-		m.smtpClients[accountIdx] = sc
-	}
-
-	sc.Lock()
-	// Check if already connected and alive
-	if sc.c != nil {
-		if err := sc.c.Noop(); err == nil {
-			return sc, nil
-		}
-		// Connection lost, try to close gently
-		_ = sc.c.Quit()
-		sc.c = nil
-	}
-
-	// Connect and login
+func (m *MailFS) connectSMTP(acc *config.MailAccount) (*smtp.Client, error) {
 	host, port, err := net.SplitHostPort(acc.SMTPHost)
 	if err != nil {
 		host = acc.SMTPHost
@@ -763,39 +791,91 @@ func (m *MailFS) getSMTPClient(accountIdx int) (*safeSMTPClient, error) {
 	if port == "465" {
 		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
 		if err != nil {
-			sc.Unlock()
-			return nil, fmt.Errorf("[Acc: %s] DialTLS: %w", acc.Email, err)
+			return nil, fmt.Errorf("DialTLS: %w", err)
 		}
 		c, err = smtp.NewClient(conn, host)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("NewClient: %w", err)
+		}
 	} else {
 		conn, err := dialer.Dial("tcp", addr)
 		if err != nil {
-			sc.Unlock()
-			return nil, fmt.Errorf("[Acc: %s] Dial: %w", acc.Email, err)
+			return nil, fmt.Errorf("Dial: %w", err)
 		}
 		c, err = smtp.NewClient(conn, host)
-		if err == nil {
-			if ok, _ := c.Extension("STARTTLS"); ok {
-				if err = c.StartTLS(tlsConfig); err != nil {
-					c.Close()
-					sc.Unlock()
-					return nil, fmt.Errorf("[Acc: %s] STARTTLS: %w", acc.Email, err)
-				}
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("NewClient: %w", err)
+		}
+		if ok, _ := c.Extension("STARTTLS"); ok {
+			if err = c.StartTLS(tlsConfig); err != nil {
+				c.Close()
+				return nil, fmt.Errorf("STARTTLS: %w", err)
 			}
 		}
 	}
+	return c, nil
+}
 
+func (m *MailFS) getSMTPClient(accountIdx int) (*safeSMTPClient, error) {
+	if accountIdx >= len(m.smtpClients) {
+		return nil, fmt.Errorf("invalid account index %d", accountIdx)
+	}
+
+	acc := m.accounts[accountIdx]
+	sc := m.smtpClients[accountIdx]
+	if sc == nil {
+		sc = &safeSMTPClient{}
+		m.smtpClients[accountIdx] = sc
+	}
+
+	sc.Lock()
+	// Check if already connected and alive
+	if sc.c != nil {
+		if err := sc.c.Noop(); err == nil {
+			return sc, nil
+		}
+		// Connection lost, try to close gently
+		_ = sc.c.Quit()
+		sc.c = nil
+	}
+
+	// Connect
+	c, err := m.connectSMTP(acc)
 	if err != nil {
 		sc.Unlock()
-		return nil, fmt.Errorf("[Acc: %s] NewClient: %w", acc.Email, err)
+		return nil, fmt.Errorf("[Acc: %s] Connect: %w", acc.Email, err)
+	}
+
+	host, _, _ := net.SplitHostPort(acc.SMTPHost)
+	if host == "" {
+		host = acc.SMTPHost
 	}
 
 	// Login
 	auth := smtp.PlainAuth("", acc.Email, acc.Password, host)
 	if err = c.Auth(auth); err != nil {
-		c.Quit()
-		sc.Unlock()
-		return nil, fmt.Errorf("[Acc: %s] Auth: %w", acc.Email, err)
+		// Fallback to LOGIN mechanism if PLAIN fails (required for Outlook)
+		// Important: If Auth fails, the connection might be closed by the server (seen with Outlook).
+		// We must Close() the old connection and Reconnect before retrying.
+		logger.Warnf("[Acc: %s] PlainAuth failed: %v. Reconnecting to retry with LOGIN auth...", acc.Email, err)
+
+		_ = c.Close() // Close the broken connection
+
+		// Reconnect
+		c, err = m.connectSMTP(acc)
+		if err != nil {
+			sc.Unlock()
+			return nil, fmt.Errorf("[Acc: %s] Reconnect failed: %w", acc.Email, err)
+		}
+
+		// Retry with LOGIN
+		if err = c.Auth(LoginAuth(acc.Email, acc.Password)); err != nil {
+			_ = c.Quit()
+			sc.Unlock()
+			return nil, fmt.Errorf("[Acc: %s] Auth failed (tried PLAIN and LOGIN): %w", acc.Email, err)
+		}
 	}
 
 	sc.c = c
@@ -1275,51 +1355,34 @@ func (m *MailFS) fetchFromEmail(accountIdx int, msgID string, key string) ([]byt
 }
 
 func (m *MailFS) rawSearchSubject(c *client.Client, key string) ([]uint32, error) {
+	// Try standard SEARCH SUBJECT first
 	cmd := &imap.Command{
 		Name: "SEARCH",
 		Arguments: []interface{}{
-			"SUBJECT",
+			imap.RawString("SUBJECT"),
 			key,
 		},
 	}
-
 	var uids []uint32
-
-	// Handler for the untagged SEARCH response
 	handler := genericHandler{
 		handle: func(resp imap.Resp) error {
-			// We cast to *imap.DataResp to access fields
 			data, ok := resp.(*imap.DataResp)
-			if !ok {
+			if !ok || len(data.Fields) == 0 || data.Fields[0] != "SEARCH" {
 				return nil
 			}
-
-			// Look for responses like: * SEARCH 123 456
-			if len(data.Fields) > 0 {
-				if op, ok := data.Fields[0].(string); ok && op == "SEARCH" {
-					for _, field := range data.Fields[1:] {
-						if num, err := imap.ParseNumber(field); err == nil {
-							uids = append(uids, num)
-						}
-					}
+			for _, field := range data.Fields[1:] {
+				if num, err := imap.ParseNumber(field); err == nil {
+					uids = append(uids, num)
 				}
 			}
 			return nil
 		},
 	}
-
-	// Execute the command
 	status, err := c.Execute(cmd, handler)
-	if err != nil {
-		return nil, err
+	if err == nil && status.Type == "OK" {
+		return uids, nil
 	}
-
-	// Check for protocol-level errors (NO/BAD) using string literals
-	if status.Type == "NO" || status.Type == "BAD" {
-		return nil, fmt.Errorf("server rejected search: %v", status.Info)
-	}
-
-	return uids, nil
+	return nil, err
 }
 
 // Helper function to find a message by key
@@ -1568,20 +1631,17 @@ func (m *MailFS) findMsgUIDClientSide(c *client.Client, key string) (uint32, err
 }
 
 func (m *MailFS) findMsgByMessageID(c *client.Client, msgID string) (uint32, error) {
-	// messageID is like "<juicefs-...@mailfs.local>"
-	// We use server-side SEARCH for Message-ID if supported, or fall back to client-side.
 	cmd := &imap.Command{
 		Name: "SEARCH",
 		Arguments: []interface{}{
-			"HEADER", "Message-ID", msgID,
+			imap.RawString("HEADER"), "Message-ID", msgID,
 		},
 	}
-
 	var uids []uint32
 	handler := genericHandler{
 		handle: func(resp imap.Resp) error {
 			data, ok := resp.(*imap.DataResp)
-			if !ok || len(data.Fields) < 2 || data.Fields[0] != "SEARCH" {
+			if !ok || len(data.Fields) == 0 || data.Fields[0] != "SEARCH" {
 				return nil
 			}
 			for _, field := range data.Fields[1:] {
@@ -1592,12 +1652,10 @@ func (m *MailFS) findMsgByMessageID(c *client.Client, msgID string) (uint32, err
 			return nil
 		},
 	}
-
 	status, err := c.Execute(cmd, handler)
 	if err == nil && status.Type == "OK" && len(uids) > 0 {
 		return uids[len(uids)-1], nil
 	}
-
 	return 0, os.ErrNotExist
 }
 
@@ -2100,4 +2158,31 @@ func (m *MailFS) WipeAllCloudData() error {
 
 	logger.Infof("Global cloud wipe complete.")
 	return nil
+}
+
+// LoginAuth implements the LOGIN authentication mechanism (Outlook compatibility).
+type loginAuth struct {
+	username, password string
+}
+
+func LoginAuth(username, password string) smtp.Auth {
+	return &loginAuth{username, password}
+}
+
+func (a *loginAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	return "LOGIN", []byte{}, nil
+}
+
+func (a *loginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
+	if more {
+		command := strings.ToLower(string(fromServer))
+		if strings.Contains(command, "username") {
+			return []byte(a.username), nil
+		}
+		if strings.Contains(command, "password") {
+			return []byte(a.password), nil
+		}
+		return nil, fmt.Errorf("unexpected server challenge: %s", string(fromServer))
+	}
+	return nil, nil
 }

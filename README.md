@@ -82,6 +82,16 @@ List all available `.mbox` files stored in your cloud storage (checks the first 
 # ...
 ```
 
+### 7. Parallelism (Speed Up)
+Speed up uploads and downloads by using multiple concurrent connections across your accounts:
+```bash
+./mbox put ./large_folder -j 8
+# Uploads or downloads multiple chunks in parallel.
+```
+- **-j, --parallel**: Set the number of concurrent connections (default: 1).
+- **-t, --timeout**: Set the timeout for uploading or downloading each data block (default: 5m). Increase this if you have very limited bandwidth (e.g., `-t 10m`).
+- **--parallel-by-provider**: If enabled, limits concurrency to only one connection per unique mail provider (host), even if multiple accounts are available for that provider. This helps avoid "Too many connections" errors or throttling from providers like Gmail or Outlook.
+
 ---
 
 ## 🚀 Design Philosophy
