@@ -272,19 +272,30 @@ func (m *MailFS) initDB() error {
 }
 
 func (m *MailFS) initIMAPConnections() error {
+	var wg sync.WaitGroup
 	for i, acc := range m.accounts {
 		// Initialize the safe client struct if nil
 		if m.imapClients[i] == nil {
 			m.imapClients[i] = &safeIMAPClient{}
 		}
 
-		c, err := m.connectIMAP(acc)
-		if err != nil {
-			logger.Warnf("Issues initializing IMAP connection for %s: %v", acc.Email, err)
-			continue
-		}
-		m.imapClients[i].c = c
+		wg.Add(1)
+		go func(i int, acc *config.MailAccount) {
+			defer wg.Done()
+			c, err := m.connectIMAP(acc)
+			if err != nil {
+				logger.Warnf("Issues initializing IMAP connection for %s: %v", acc.Email, err)
+				return
+			}
+			// Safe to assign without lock here as NewMailFS is single-threaded initialization
+			// and no external consumers have access to mfs yet.
+			// But for correctness with the new getIMAPClient which checks .c, we just set it.
+			m.imapClients[i].Lock()
+			m.imapClients[i].c = c
+			m.imapClients[i].Unlock()
+		}(i, acc)
 	}
+	wg.Wait()
 	return nil
 }
 
@@ -558,6 +569,46 @@ func (m *MailFS) Get(key string, off, limit int64, getters ...object.AttrGetter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve blob %s from any source: %w", key, err)
 	}
+
+	// 5. Update Cache (Memory + DB) to prevent future fetches
+	// We do this asynchronously to not block the read, or synchronously?
+	// Synchronous is safer for the "download twice" issue immediately following.
+	m.Lock()
+	// Update Memory Cache
+	m.blobCache[key] = &mailBlob{
+		key:     key,
+		size:    int64(len(data)),
+		mtime:   time.Now(), // approximate
+		data:    data,
+		account: primaryIdx,
+	}
+
+	// Update DB (Do in background or here? Here is safer for consistency)
+	// We need to insert metadata conformant with schema
+	// We might not have all fields like 'msg_id' perfect if we didn't query them,
+	// but we fetched them.
+	// Actually, we queried metadata earlier: primaryIdx, primaryMsgID, etc.
+	if !m.config.NoCache {
+		// Use ignoring insert or replace
+		// We only need to update the DATA. Metadata should be there if it was found via List,
+		// but if it was found via direct access it might be missing?
+		// Actually Get tries DB metadata first. If it wasn't in DB, we need to insert everything.
+		// If it WAS in DB but data was nil, we update data.
+		now := time.Now().UnixNano()
+		_, dbErr := m.db.Exec(`INSERT OR REPLACE INTO blob_data (key, data) VALUES (?, ?)`, key, data)
+		if dbErr != nil {
+			logger.Warnf("Failed to update blob_data cache for %s: %v", key, dbErr)
+		}
+
+		// Ensure metadata exists
+		_, dbErr = m.db.Exec(`INSERT OR IGNORE INTO blobs (key, size, mtime, account, replica_account, msg_id, replica_msg_id, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			key, int64(len(data)), now, primaryIdx, replicaIdx, primaryMsgID, replicaMsgID, now)
+		if dbErr != nil {
+			logger.Warnf("Failed to update blobs metadata for %s: %v", key, dbErr)
+		}
+	}
+	m.Unlock()
 
 	return m.readRange(data, off, limit), nil
 }
