@@ -879,7 +879,7 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 		return "", emailErr("closing data writer failed", err)
 	}
 
-	logger.Infof("[SMTP] Successfully stored blob %s in email (MsgID: %s)", key, msgID)
+	logger.Infof("[SMTP] Successfully stored blob chunk %s in email (MsgID: %s), account=%d, %s", key, msgID, accountIdx, acc.Email)
 	return msgID, nil
 }
 
@@ -1825,5 +1825,149 @@ func (m *MailFS) Close() error {
 	if m.db != nil {
 		return m.db.Close()
 	}
+	return nil
+}
+func (m *MailFS) WipeAllCloudData() error {
+	for i, acc := range m.accounts {
+		logger.Infof("Wiping account %d: %s", i, acc.Email)
+		safeClient, err := m.getIMAPClient(i)
+		if err != nil {
+			logger.Errorf("Failed to connect to %s for wipe: %v", acc.Email, err)
+			continue
+		}
+
+		// Use a closure to handle the lock/unlock properly for each account
+		func() {
+			defer safeClient.Unlock()
+			c := safeClient.c
+			info, err := c.Select("INBOX", false)
+			if err != nil {
+				logger.Errorf("Select INBOX failed for %s: %v", acc.Email, err)
+				return
+			}
+			if info.Messages == 0 {
+				return
+			}
+
+			// 1. Collect potential candidates using broad search terms
+			searchTerms := []string{"MBOX", "JuiceFS"}
+			candidateUIDs := make(map[uint32]bool)
+			for _, term := range searchTerms {
+				ids, err := m.rawSearchSubject(c, term)
+				if err != nil {
+					logger.Debugf("Broad search for %s failed on %s: %v", term, acc.Email, err)
+					continue
+				}
+				for _, id := range ids {
+					candidateUIDs[id] = true
+				}
+			}
+
+			// 2. Fallback: If search yielded nothing but we have messages, scan the last 1000 messages client-side.
+			if len(candidateUIDs) == 0 {
+				const fallbackDepth = 1000
+				from := uint32(1)
+				if info.Messages > fallbackDepth {
+					from = info.Messages - fallbackDepth + 1
+				}
+				for j := from; j <= info.Messages; j++ {
+					candidateUIDs[j] = true
+				}
+			}
+
+			if len(candidateUIDs) == 0 {
+				return
+			}
+
+			// 3. Verify candidates client-side using regular prefixes
+			prefixes := []string{m.config.SubjectPrefix, "MBox Config: ", "JuiceFS Blob :"}
+
+			var ids []uint32
+			for id := range candidateUIDs {
+				ids = append(ids, id)
+			}
+			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+			// Fetch Subjects in batches to avoid overwhelming the server
+			const batchSize = 500
+			matchesTotal := 0
+			for j := 0; j < len(ids); j += batchSize {
+				end := j + batchSize
+				if end > len(ids) {
+					end = len(ids)
+				}
+
+				batchSet := new(imap.SeqSet)
+				batchSet.AddNum(ids[j:end]...)
+
+				section := &imap.BodySectionName{
+					BodyPartName: imap.BodyPartName{Specifier: imap.HeaderSpecifier, Fields: []string{"Subject"}},
+					Peek:         true,
+				}
+				messages := make(chan *imap.Message, batchSize)
+				done := make(chan error, 1)
+
+				go func() {
+					done <- c.Fetch(batchSet, []imap.FetchItem{section.FetchItem()}, messages)
+				}()
+
+				deleteSet := new(imap.SeqSet)
+				matchesInBatch := 0
+				for msg := range messages {
+					r := msg.GetBody(section)
+					if r == nil {
+						continue
+					}
+					headerBytes, _ := io.ReadAll(r)
+					subject := string(headerBytes)
+
+					matched := false
+					for _, p := range prefixes {
+						if strings.Contains(subject, p) {
+							matched = true
+							break
+						}
+					}
+
+					if matched {
+						deleteSet.AddNum(msg.SeqNum)
+						matchesInBatch++
+					}
+				}
+
+				if err := <-done; err != nil {
+					logger.Errorf("Fetch failed during wipe on %s: %v", acc.Email, err)
+					continue
+				}
+
+				if matchesInBatch > 0 {
+					item := imap.FormatFlagsOp(imap.AddFlags, true)
+					flags := []interface{}{imap.DeletedFlag}
+					if err := c.Store(deleteSet, item, flags, nil); err != nil {
+						logger.Errorf("Wipe: marking deleted failed for %s: %v", acc.Email, err)
+					}
+					matchesTotal += matchesInBatch
+				}
+			}
+
+			if matchesTotal > 0 {
+				logger.Infof("Wiped %d messages from %s", matchesTotal, acc.Email)
+				if err := c.Expunge(nil); err != nil {
+					logger.Errorf("Wipe: expunge failed for %s: %v", acc.Email, err)
+				}
+			}
+		}()
+	}
+
+	// Also clear local metadata and cache
+	m.Lock()
+	m.blobCache = make(map[string]*mailBlob)
+	if m.db != nil {
+		_, _ = m.db.Exec("DELETE FROM blobs")
+		_, _ = m.db.Exec("DELETE FROM blob_data")
+	}
+	m.Unlock()
+
+	logger.Infof("Global cloud wipe complete.")
 	return nil
 }
