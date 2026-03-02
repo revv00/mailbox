@@ -29,7 +29,7 @@ DOCKER_RUN := docker run --rm \
 	-e CGO_ENABLED=1 \
 	--entrypoint /bin/bash $(DOCKER_IMAGE) -c
 
-.PHONY: all mbox lite clean docker-lite-linux docker-lite-darwin-amd64 docker-lite-darwin-arm64 docker-lite-windows-amd64 docker-lite-all
+.PHONY: all mbox lite clean docker-lite-linux docker-lite-darwin-amd64 docker-lite-darwin-arm64 docker-lite-windows-amd64 docker-lite-all test-single test-multi test-del
 
 all: mbox
 
@@ -56,3 +56,12 @@ docker-lite-all: docker-lite-linux docker-lite-darwin-amd64 docker-lite-darwin-a
 
 clean:
 	rm -f $(BINARY) $(BINARY).lite *.exe $(BINARY)-linux-amd64 $(BINARY)-darwin-amd64 $(BINARY)-darwin-arm64
+
+test-single:
+	./run_test_single.sh
+
+test-multi:
+	./run_test_multi.sh
+
+test-del:
+	./run_test_del.sh

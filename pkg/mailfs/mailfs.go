@@ -747,21 +747,21 @@ func (m *MailFS) readRange(data []byte, off, limit int64) io.ReadCloser {
 }
 
 func (m *MailFS) storeWithRetry(initialIdx int, otherIdx int, key string, data []byte) (int, string, error) {
-	// 0. Check if it already exists in the cloud for this account
+	// 1. Check if it already exists in the cloud for the INTENDED accounts (primary/replica)
+	// This handles resumes where the local DB record might be missing but the cloud has it.
 	if mid, err := m.findBlobInCloud(initialIdx, key); err == nil && mid != "" {
-		logger.Infof("[MailFS] Found existing blob %s in account %d, skipping upload", key, initialIdx)
+		logger.Infof("[MailFS] Found existing blob %s in account %d (primary), skipping upload", key, initialIdx)
 		return initialIdx, mid, nil
 	}
 
-	// 0.1 Check the "other" (replica) account too, just in case
-	if otherIdx != initialIdx {
+	if otherIdx != initialIdx && otherIdx >= 0 {
 		if mid, err := m.findBlobInCloud(otherIdx, key); err == nil && mid != "" {
-			logger.Infof("[MailFS] Found existing blob %s in replica account %d, skipping upload", key, otherIdx)
+			logger.Infof("[MailFS] Found existing blob %s in account %d (intended replica), skipping upload", key, otherIdx)
 			return otherIdx, mid, nil
 		}
 	}
 
-	// 1. Try initialIdx
+	// 2. Try to upload to initialIdx
 	msgID, err := func() (string, error) {
 		unlock := m.lockAccounts(initialIdx)
 		defer unlock()
@@ -771,7 +771,7 @@ func (m *MailFS) storeWithRetry(initialIdx int, otherIdx int, key string, data [
 		return initialIdx, msgID, nil
 	}
 
-	logger.Warnf("Failed to store in account %d (%s) for key %s: %v. Trying alternatives...",
+	logger.Warnf("Failed to store in primary account %d (%s) for key %s: %v. Trying alternative accounts...",
 		initialIdx, m.accounts[initialIdx].Email, key, err)
 
 	// Find alternatives
@@ -806,11 +806,11 @@ func (m *MailFS) storeWithRetry(initialIdx int, otherIdx int, key string, data [
 
 	var lastErr error = err
 	for _, altIdx := range alternatives {
-		// Check cloud for alternative FIRST
-		if mid, err := m.findBlobInCloud(altIdx, key); err == nil && mid != "" {
-			logger.Infof("[MailFS] Found existing blob %s in alternative account %d, skipping re-upload", key, altIdx)
-			return altIdx, mid, nil
-		}
+		// Optimization: For alternative accounts, we skip the eager IMAP cloud check
+		// to avoid a connection storm. We just try to store it directly via SMTP.
+		// If it was already there, we might create a duplicate, but that's safer/faster
+		// than opening IMAP connections for all accounts on every failed chunk.
+		logger.Debugf("Trying alternative account %d (%s) for key %s", altIdx, m.accounts[altIdx].Email, key)
 
 		mid, err := func() (string, error) {
 			unlock := m.lockAccounts(altIdx)
@@ -869,7 +869,7 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 	}
 
 	if !needPrimary && !needReplica {
-		logger.Debugf("[MailFS] Blob %s already exists in database with all required replicas, skipping", key)
+		logger.Infof("[MailFS] Blob %s already exists in local record, skipping", key)
 		return nil
 	}
 
@@ -1168,6 +1168,19 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 	}
 
 	logger.Infof("[SMTP] Successfully stored blob chunk %s in email (MsgID: %s), account=%d, %s", key, msgID, accountIdx, acc.Email)
+
+	if m.config.RemoveSent {
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			// Some servers take a few seconds to populate the Sent folder
+			time.Sleep(5 * time.Second)
+			if err := m.deleteSentMessage(accountIdx, msgID); err != nil {
+				logger.Warnf("Failed to remove sent email %s: %v", msgID, err)
+			}
+		}()
+	}
+
 	return msgID, nil
 }
 
@@ -1216,8 +1229,9 @@ func (m *MailFS) storeGenericFile(subject string, filename string, data []byte) 
 	fmt.Fprintf(body, "From: %s\r\n", acc.Email)
 	fmt.Fprintf(body, "To: %s\r\n", acc.Email)
 	fmt.Fprintf(body, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
+	msgID := fmt.Sprintf("<mbox-cfg-%d@%s>", time.Now().UnixNano(), getDomain(acc.Email))
 	fmt.Fprintf(body, "Subject: %s\r\n", subject)
-	fmt.Fprintf(body, "Message-ID: <mbox-cfg-%d@%s>\r\n", time.Now().UnixNano(), getDomain(acc.Email))
+	fmt.Fprintf(body, "Message-ID: %s\r\n", msgID)
 	fmt.Fprintf(body, "MIME-Version: 1.0\r\n")
 	fmt.Fprintf(body, "Content-Type: multipart/mixed; boundary=%s\r\n\r\n", boundary)
 
@@ -1262,6 +1276,19 @@ func (m *MailFS) storeGenericFile(subject string, filename string, data []byte) 
 	if err = w.Close(); err != nil {
 		return emailErr("closing data writer failed", err)
 	}
+
+	if m.config.RemoveSent {
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			// Some servers take a few seconds to populate the Sent folder
+			time.Sleep(5 * time.Second)
+			if err := m.deleteSentMessage(accountIdx, msgID); err != nil {
+				logger.Warnf("Failed to remove sent mbox config %s: %v", msgID, err)
+			}
+		}()
+	}
+
 	return nil
 }
 
@@ -1472,7 +1499,7 @@ func (m *MailFS) fetchFromEmail(accountIdx int, msgID string, key string) ([]byt
 	var seqNum uint32
 	var err error
 	if msgID != "" {
-		seqNum, _ = m.findMsgByMessageID(c, msgID)
+		seqNum, _ = m.findMsgByMessageID(c, "INBOX", msgID)
 	}
 
 	// 2. If not found, fallback to search by key in subject
@@ -1852,14 +1879,27 @@ func (m *MailFS) findMsgUIDClientSide(c *client.Client, key string, isBlob bool)
 	return foundSeqNum, nil
 }
 
-func (m *MailFS) findMsgByMessageID(c *client.Client, msgID string) (uint32, error) {
+func (m *MailFS) findMsgByMessageID(c *client.Client, folder string, msgID string) (uint32, error) {
+	if msgID == "" {
+		return 0, os.ErrNotExist
+	}
+	if folder == "" {
+		folder = "INBOX"
+	}
+
+	mbox, err := c.Select(folder, false)
+	if err != nil {
+		return 0, fmt.Errorf("select folder %s: %w", folder, err)
+	}
+
+	// 1. Try Raw Server-Side Search
 	cmd := &imap.Command{
 		Name: "SEARCH",
 		Arguments: []interface{}{
 			imap.RawString("HEADER"), "Message-ID", msgID,
 		},
 	}
-	var uids []uint32
+	var ids []uint32
 	handler := genericHandler{
 		handle: func(resp imap.Resp) error {
 			data, ok := resp.(*imap.DataResp)
@@ -1868,17 +1908,175 @@ func (m *MailFS) findMsgByMessageID(c *client.Client, msgID string) (uint32, err
 			}
 			for _, field := range data.Fields[1:] {
 				if num, err := imap.ParseNumber(field); err == nil {
-					uids = append(uids, num)
+					ids = append(ids, num)
 				}
 			}
 			return nil
 		},
 	}
 	status, err := c.Execute(cmd, handler)
-	if err == nil && status.Type == "OK" && len(uids) > 0 {
-		return uids[len(uids)-1], nil
+	if err != nil || status.Type != "OK" {
+		logger.Warnf("[IMAP] raw SEARCH for Message-ID %s in %s failed: %v", msgID, folder, err)
 	}
-	return 0, os.ErrNotExist
+
+	// 2. Fallback: Search for recent messages if specific msgID search failed
+	if len(ids) == 0 && mbox.Messages > 0 {
+		const fallbackDepth = 1000
+		from := uint32(1)
+		if mbox.Messages > fallbackDepth {
+			from = mbox.Messages - fallbackDepth + 1
+		}
+		for j := from; j <= mbox.Messages; j++ {
+			ids = append(ids, j)
+		}
+	}
+
+	if len(ids) == 0 {
+		return 0, os.ErrNotExist
+	}
+
+	// 3. Client-Side Verification
+	seqSet := new(imap.SeqSet)
+	seqSet.AddNum(ids...)
+
+	items := []imap.FetchItem{imap.FetchEnvelope}
+	messages := make(chan *imap.Message, len(ids))
+	done := make(chan error, 1)
+
+	go func() {
+		done <- c.Fetch(seqSet, items, messages)
+	}()
+
+	var confirmedUID uint32
+	for msg := range messages {
+		if msg.Envelope != nil && msg.Envelope.MessageId == msgID {
+			confirmedUID = msg.SeqNum
+		}
+	}
+
+	if err := <-done; err != nil {
+		return 0, err
+	}
+
+	if confirmedUID == 0 {
+		return 0, os.ErrNotExist
+	}
+	return confirmedUID, nil
+}
+
+func (m *MailFS) findSentFolder(c *client.Client) (string, error) {
+	// 1. Try to find by attribute \Sent
+	mailboxes := make(chan *imap.MailboxInfo, 64)
+	done := make(chan error, 1)
+	go func() {
+		done <- c.List("", "*", mailboxes)
+	}()
+
+	var fallbackSent string
+	for info := range mailboxes {
+		if info == nil {
+			continue
+		}
+		for _, attr := range info.Attributes {
+			if attr == imap.SentAttr {
+				return info.Name, nil
+			}
+		}
+		nameLower := strings.ToLower(info.Name)
+		if strings.Contains(nameLower, "sent") {
+			// Prioritize exact "sent"
+			if nameLower == "sent" {
+				fallbackSent = info.Name
+			} else if fallbackSent == "" || !strings.EqualFold(fallbackSent, "sent") {
+				// Other candidates: "Sent Messages", "Sent Items"
+				if strings.Contains(nameLower, "item") || strings.Contains(nameLower, "message") {
+					fallbackSent = info.Name
+				}
+			}
+		}
+	}
+
+	if err := <-done; err != nil {
+		return "", err
+	}
+
+	if fallbackSent != "" {
+		return fallbackSent, nil
+	}
+
+	return "", fmt.Errorf("sent folder not found")
+}
+
+func (m *MailFS) deleteSentMessage(accountIdx int, messageID string) error {
+	var sentFolder string
+	var uid uint32
+	var err error
+
+	// 1. Find the message with retries (acquire/release lock each time)
+	MAX_RETRIES := 1
+	for retry := 1; retry <= MAX_RETRIES; retry++ {
+		err = func() error {
+			safeClient, err := m.getIMAPClient(accountIdx)
+			if err != nil {
+				return err
+			}
+			defer safeClient.Unlock()
+			c := safeClient.c
+
+			if sentFolder == "" {
+				sentFolder, err = m.findSentFolder(c)
+				if err != nil {
+					return err
+				}
+			}
+
+			id, err := m.findMsgByMessageID(c, sentFolder, messageID)
+			if err == nil {
+				uid = id
+				return nil
+			}
+			return err
+		}()
+
+		if err == nil {
+			break
+		}
+		if err != os.ErrNotExist {
+			return fmt.Errorf("findMsgByMessageID: %w", err)
+		}
+		if retry < MAX_RETRIES {
+			logger.Debugf("[IMAP] Sent message %s not found in %s (attempt %d/3), retrying in 5s...", messageID, sentFolder, retry)
+			time.Sleep(5 * time.Second)
+		}
+	}
+
+	if uid == 0 {
+		logger.Warnf("[IMAP] Sent message %s not found in folder %s after retries", messageID, sentFolder)
+		return nil
+	}
+
+	// 2. Perform deletion (acquire lock again)
+	safeClient, err := m.getIMAPClient(accountIdx)
+	if err != nil {
+		return err
+	}
+	defer safeClient.Unlock()
+	c := safeClient.c
+
+	seqSet := new(imap.SeqSet)
+	seqSet.AddNum(uid)
+	item := imap.FormatFlagsOp(imap.AddFlags, true)
+	flags := []interface{}{imap.DeletedFlag}
+	if err := c.Store(seqSet, item, flags, nil); err != nil {
+		return fmt.Errorf("mark deleted: %w", err)
+	}
+
+	if err := c.Expunge(nil); err != nil {
+		return fmt.Errorf("expunge: %w", err)
+	}
+
+	logger.Infof("[IMAP] Successfully removed sent message %s from %s", messageID, sentFolder)
+	return nil
 }
 
 func isBase64(s string) bool {
@@ -1957,7 +2155,7 @@ func (m *MailFS) Delete(key string, getters ...object.AttrGetter) error {
 			c := safeClient.c
 			var id uint32
 			if targetMsgID != "" {
-				id, _ = m.findMsgByMessageID(c, targetMsgID)
+				id, _ = m.findMsgByMessageID(c, "INBOX", targetMsgID)
 			}
 			if id == 0 {
 				id, _ = m.findMsgUID(c, key, true)
@@ -2066,7 +2264,7 @@ func (m *MailFS) BatchDelete(keys []string) error {
 				}
 
 				if msgID != "" {
-					id, _ = m.findMsgByMessageID(c, msgID)
+					id, _ = m.findMsgByMessageID(c, "INBOX", msgID)
 				}
 				if id == 0 {
 					id, _ = m.findMsgUID(c, info.key, true)
@@ -2250,121 +2448,13 @@ func (m *MailFS) WipeAllCloudData() error {
 		func() {
 			defer safeClient.Unlock()
 			c := safeClient.c
-			info, err := c.Select("INBOX", false)
-			if err != nil {
-				logger.Errorf("Select INBOX failed for %s: %v", acc.Email, err)
-				return
-			}
-			if info.Messages == 0 {
-				return
-			}
 
-			// 1. Collect potential candidates using broad search terms
-			searchTerms := []string{"MBOX", "JuiceFS"}
-			candidateUIDs := make(map[uint32]bool)
-			for _, term := range searchTerms {
-				ids, err := m.rawSearchSubject(c, term)
-				if err != nil {
-					logger.Debugf("Broad search for %s failed on %s: %v", term, acc.Email, err)
-					continue
-				}
-				for _, id := range ids {
-					candidateUIDs[id] = true
-				}
-			}
+			// 1. Wipe INBOX
+			m.wipeFolder(c, "INBOX", acc.Email)
 
-			// 2. Fallback: If search yielded nothing but we have messages, scan the last 1000 messages client-side.
-			if len(candidateUIDs) == 0 {
-				const fallbackDepth = 1000
-				from := uint32(1)
-				if info.Messages > fallbackDepth {
-					from = info.Messages - fallbackDepth + 1
-				}
-				for j := from; j <= info.Messages; j++ {
-					candidateUIDs[j] = true
-				}
-			}
-
-			if len(candidateUIDs) == 0 {
-				return
-			}
-
-			// 3. Verify candidates client-side using regular prefixes
-			prefixes := []string{m.config.SubjectPrefix, "MBox Config: ", "JuiceFS Blob :"}
-
-			var ids []uint32
-			for id := range candidateUIDs {
-				ids = append(ids, id)
-			}
-			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-
-			// Fetch Subjects in batches to avoid overwhelming the server
-			const batchSize = 500
-			matchesTotal := 0
-			for j := 0; j < len(ids); j += batchSize {
-				end := j + batchSize
-				if end > len(ids) {
-					end = len(ids)
-				}
-
-				batchSet := new(imap.SeqSet)
-				batchSet.AddNum(ids[j:end]...)
-
-				section := &imap.BodySectionName{
-					BodyPartName: imap.BodyPartName{Specifier: imap.HeaderSpecifier, Fields: []string{"Subject"}},
-					Peek:         true,
-				}
-				messages := make(chan *imap.Message, batchSize)
-				done := make(chan error, 1)
-
-				go func() {
-					done <- c.Fetch(batchSet, []imap.FetchItem{section.FetchItem()}, messages)
-				}()
-
-				deleteSet := new(imap.SeqSet)
-				matchesInBatch := 0
-				for msg := range messages {
-					r := msg.GetBody(section)
-					if r == nil {
-						continue
-					}
-					headerBytes, _ := io.ReadAll(r)
-					subject := string(headerBytes)
-
-					matched := false
-					for _, p := range prefixes {
-						if strings.Contains(subject, p) {
-							matched = true
-							break
-						}
-					}
-
-					if matched {
-						deleteSet.AddNum(msg.SeqNum)
-						matchesInBatch++
-					}
-				}
-
-				if err := <-done; err != nil {
-					logger.Errorf("Fetch failed during wipe on %s: %v", acc.Email, err)
-					continue
-				}
-
-				if matchesInBatch > 0 {
-					item := imap.FormatFlagsOp(imap.AddFlags, true)
-					flags := []interface{}{imap.DeletedFlag}
-					if err := c.Store(deleteSet, item, flags, nil); err != nil {
-						logger.Errorf("Wipe: marking deleted failed for %s: %v", acc.Email, err)
-					}
-					matchesTotal += matchesInBatch
-				}
-			}
-
-			if matchesTotal > 0 {
-				logger.Infof("Wiped %d messages from %s", matchesTotal, acc.Email)
-				if err := c.Expunge(nil); err != nil {
-					logger.Errorf("Wipe: expunge failed for %s: %v", acc.Email, err)
-				}
+			// 2. Wipe Sent folder if found
+			if sentFolder, err := m.findSentFolder(c); err == nil && sentFolder != "INBOX" {
+				m.wipeFolder(c, sentFolder, acc.Email)
 			}
 		}()
 	}
@@ -2380,6 +2470,126 @@ func (m *MailFS) WipeAllCloudData() error {
 
 	logger.Infof("Global cloud wipe complete.")
 	return nil
+}
+
+func (m *MailFS) wipeFolder(c *client.Client, folderName string, email string) {
+	logger.Infof("Wiping folder %s on %s", folderName, email)
+	info, err := c.Select(folderName, false)
+	if err != nil {
+		logger.Errorf("Select %s failed for %s: %v", folderName, email, err)
+		return
+	}
+	if info.Messages == 0 {
+		return
+	}
+
+	// 1. Collect potential candidates using broad search terms
+	searchTerms := []string{"MBOX", "JuiceFS"}
+	candidateUIDs := make(map[uint32]bool)
+	for _, term := range searchTerms {
+		ids, err := m.rawSearchSubject(c, term)
+		if err != nil {
+			logger.Debugf("Broad search for %s failed on %s:%s: %v", term, email, folderName, err)
+			continue
+		}
+		for _, id := range ids {
+			candidateUIDs[id] = true
+		}
+	}
+
+	// 2. Fallback: If search yielded nothing but we have messages, scan the last 1000 messages client-side.
+	if len(candidateUIDs) == 0 {
+		const fallbackDepth = 1000
+		from := uint32(1)
+		if info.Messages > fallbackDepth {
+			from = info.Messages - fallbackDepth + 1
+		}
+		for j := from; j <= info.Messages; j++ {
+			candidateUIDs[j] = true
+		}
+	}
+
+	if len(candidateUIDs) == 0 {
+		return
+	}
+
+	// 3. Verify candidates client-side using regular prefixes
+	prefixes := []string{m.config.SubjectPrefix, "MBox Config: ", "JuiceFS Blob :"}
+
+	var ids []uint32
+	for id := range candidateUIDs {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	// Fetch Subjects in batches to avoid overwhelming the server
+	const batchSize = 500
+	matchesTotal := 0
+	for j := 0; j < len(ids); j += batchSize {
+		end := j + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+
+		batchSet := new(imap.SeqSet)
+		batchSet.AddNum(ids[j:end]...)
+
+		section := &imap.BodySectionName{
+			BodyPartName: imap.BodyPartName{Specifier: imap.HeaderSpecifier, Fields: []string{"Subject"}},
+			Peek:         true,
+		}
+		messages := make(chan *imap.Message, batchSize)
+		done := make(chan error, 1)
+
+		go func() {
+			done <- c.Fetch(batchSet, []imap.FetchItem{section.FetchItem()}, messages)
+		}()
+
+		deleteSet := new(imap.SeqSet)
+		matchesInBatch := 0
+		for msg := range messages {
+			r := msg.GetBody(section)
+			if r == nil {
+				continue
+			}
+			headerBytes, _ := io.ReadAll(r)
+			subject := string(headerBytes)
+
+			matched := false
+			for _, p := range prefixes {
+				if strings.Contains(subject, p) {
+					matched = true
+					break
+				}
+			}
+
+			if matched {
+				deleteSet.AddNum(msg.SeqNum)
+				matchesInBatch++
+			}
+		}
+
+		if err := <-done; err != nil {
+			logger.Errorf("Fetch failed during wipe on %s:%s: %v", email, folderName, err)
+			continue
+		}
+
+		if matchesInBatch > 0 {
+			item := imap.FormatFlagsOp(imap.AddFlags, true)
+			flags := []interface{}{imap.DeletedFlag}
+			if err := c.Store(deleteSet, item, flags, nil); err != nil {
+				logger.Errorf("Wipe: marking deleted failed for %s:%s: %v", email, folderName, err)
+			}
+			matchesTotal += matchesInBatch
+		}
+	}
+
+	if matchesTotal > 0 {
+		logger.Infof("Wiped %d messages from %s:%s", matchesTotal, email, folderName)
+		if err := c.Expunge(nil); err != nil {
+			logger.Errorf("Wipe: expunge failed for %s:%s: %v", email, folderName, err)
+		}
+	}
 }
 
 func (m *MailFS) updateBlobMetadataInternal(key string, size int64, accountIdx int, msgID string, isPrimary bool) error {

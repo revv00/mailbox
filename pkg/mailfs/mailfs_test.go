@@ -544,3 +544,151 @@ func TestOffsetAndLimit(t *testing.T) {
 		t.Errorf("Limit mismatch: expected '56789', got '%s'", string(data))
 	}
 }
+
+func TestDeleteSentMessage(t *testing.T) {
+	configPath := os.Getenv("TEST_CONFIG")
+	if configPath == "" {
+		t.Skip("Skipping integration test: TEST_CONFIG env var not set")
+	}
+
+	dbPath := "test-delete-sent.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	cfg, ok := loadConfigFromFile(configPath, dbPath)
+	if !ok || len(cfg.Accounts) == 0 {
+		t.Fatalf("Failed to load valid configuration from %s", configPath)
+	}
+
+	// For this test, we want to call it manually, so we ensure RemoveSent is false
+	// to avoid the automatic goroutine.
+	cfg.RemoveSent = false
+
+	mfs, err := NewMailFS(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create MailFS: %v", err)
+	}
+	defer mfs.Close()
+
+	testKey := "test-delete-sent-" + fmt.Sprintf("%d", time.Now().Unix()%10000)
+	testData := []byte("Test data for delete sent message " + time.Now().Format(time.RFC3339))
+
+	// 1. Store the blob (this sends the email)
+	t.Logf("Storing blob %s...", testKey)
+	msgID, err := mfs.storeInEmail(0, testKey, testData)
+	if err != nil {
+		t.Fatalf("storeInEmail failed: %v", err)
+	}
+	t.Logf("Blob stored, MsgID: %s", msgID)
+
+	// Wait a bit for the mail server to process the "Sent" message
+	// Some servers (like Gmail or Outlook) might take a few seconds to populate the Sent folder
+	t.Log("Waiting for message to appear in Sent folder...")
+	time.Sleep(5 * time.Second)
+
+	// 2. Call deleteSentMessage
+	t.Logf("Calling deleteSentMessage for MsgID: %s", msgID)
+	err = mfs.deleteSentMessage(0, msgID)
+	if err != nil {
+		t.Fatalf("deleteSentMessage failed: %v", err)
+	}
+	t.Log("deleteSentMessage executed successfully")
+
+	// 3. Verify it's gone
+	safeClient, err := mfs.getIMAPClient(0)
+	if err != nil {
+		t.Fatalf("getIMAPClient failed: %v", err)
+	}
+	defer safeClient.Unlock()
+
+	sentFolder, err := mfs.findSentFolder(safeClient.c)
+	if err != nil {
+		t.Fatalf("findSentFolder failed: %v", err)
+	}
+	t.Logf("Searching for MsgID %s in folder %s to verify deletion...", msgID, sentFolder)
+
+	uid, err := mfs.findMsgByMessageID(safeClient.c, sentFolder, msgID)
+	if err == nil {
+		t.Errorf("❌ ERROR: Message %s still exists in folder %s (UID: %d)", msgID, sentFolder, uid)
+	} else if err != os.ErrNotExist {
+		t.Errorf("❌ ERROR: Unexpected error when searching for deleted message: %v", err)
+	} else {
+		t.Log("✅ SUCCESS: Message is gone from Sent folder.")
+	}
+}
+
+func TestPutWithRemoveSent(t *testing.T) {
+	configPath := os.Getenv("TEST_CONFIG")
+	if configPath == "" {
+		t.Skip("Skipping integration test: TEST_CONFIG env var not set")
+	}
+
+	dbPath := "test-put-remove-sent.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	cfg, ok := loadConfigFromFile(configPath, dbPath)
+	if !ok || len(cfg.Accounts) == 0 {
+		t.Fatalf("Failed to load valid configuration from %s", configPath)
+	}
+
+	// ENABLE RemoveSent
+	cfg.RemoveSent = true
+
+	mfs, err := NewMailFS(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create MailFS: %v", err)
+	}
+	defer mfs.Close() // Close will wait for background deletions
+
+	testKey := "test-put-remove-sent-" + fmt.Sprintf("%d", time.Now().Unix()%10000)
+	testData := []byte("Test data for Put with RemoveSent " + time.Now().Format(time.RFC3339))
+
+	// 1. Perform Put
+	t.Logf("Performing Put for blob %s...", testKey)
+	err = mfs.Put(testKey, bytes.NewReader(testData))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	t.Logf("Put successful. Background deletion should be in progress.")
+
+	// 2. Wait for background deletion to finish
+	// We call Close() which calls m.wg.Wait()
+	t.Log("Closing MailFS (waiting for background deletions)...")
+	start := time.Now()
+	mfs.Close()
+	t.Logf("MailFS closed in %v", time.Since(start))
+
+	// 3. Verify it's gone from Sent folder
+	// We need a new client to check
+	mfs2, _ := NewMailFS(cfg)
+	defer mfs2.Close()
+
+	safeClient, err := mfs2.getIMAPClient(0)
+	if err != nil {
+		t.Fatalf("getIMAPClient failed: %v", err)
+	}
+	defer safeClient.Unlock()
+
+	sentFolder, err := mfs2.findSentFolder(safeClient.c)
+	if err != nil {
+		t.Fatalf("findSentFolder failed: %v", err)
+	}
+
+	// We need the MsgID to verify. We can get it from the local DB.
+	var msgID string
+	err = mfs2.db.QueryRow("SELECT msg_id FROM blobs WHERE key = ?", testKey).Scan(&msgID)
+	if err != nil {
+		t.Fatalf("Failed to get msg_id from DB: %v", err)
+	}
+	t.Logf("Verifying deletion of MsgID: %s in %s", msgID, sentFolder)
+
+	uid, err := mfs2.findMsgByMessageID(safeClient.c, sentFolder, msgID)
+	if err == nil {
+		t.Errorf("❌ ERROR: Message %s still exists in Sent folder (UID: %d)", msgID, uid)
+	} else if err != os.ErrNotExist {
+		t.Errorf("❌ ERROR: Unexpected error: %v", err)
+	} else {
+		t.Log("✅ SUCCESS: Message is gone from Sent folder after Put.")
+	}
+}

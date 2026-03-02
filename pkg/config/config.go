@@ -54,6 +54,7 @@ type MailFSConfig struct {
 	NoCache            bool   // If true, data is not stored in local DB
 	SubjectPrefix      string // Prefix for email subjects
 	ParallelByProvider bool   // If true, limit concurrency per email provider
+	RemoveSent         bool   // If true, remove sent emails from Sent folder after upload
 }
 
 // MailProvider represents common email providers with preset configurations
@@ -112,12 +113,13 @@ var Providers = map[string]MailProvider{
 
 // AccountConfig is used for loading accounts from JSON/YAML
 type AccountConfig struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-	Provider string `json:"provider,omitempty"` // gmail, outlook, yahoo, etc.
-	IMAPHost string `json:"imapHost,omitempty"` // camelCase for JSON compatibility
-	SMTPHost string `json:"smtpHost,omitempty"` // camelCase for JSON compatibility
-	Folder   string `json:"folder,omitempty"`
+	Email      string `json:"email"`
+	Password   string `json:"password"`
+	Provider   string `json:"provider,omitempty"` // gmail, outlook, yahoo, etc.
+	IMAPHost   string `json:"imapHost,omitempty"` // camelCase for JSON compatibility
+	SMTPHost   string `json:"smtpHost,omitempty"` // camelCase for JSON compatibility
+	Folder     string `json:"folder,omitempty"`
+	RemoveSent bool   `json:"remove_sent,omitempty"`
 }
 
 // ParsedConfig holds accounts and global settings
@@ -126,6 +128,7 @@ type ParsedConfig struct {
 	Replication        int
 	SubjectPrefix      string
 	ParallelByProvider bool
+	RemoveSent         bool
 }
 
 // LoadAccountsFromJSON loads email accounts and global settings from JSON file
@@ -143,6 +146,7 @@ func LoadAccountsFromJSON(filePath string) (*ParsedConfig, error) {
 		Accounts      []AccountConfig `json:"accounts"`
 		Replication   int             `json:"replication"`
 		SubjectPrefix string          `json:"subject_prefix"`
+		RemoveSent    bool            `json:"remove_sent"`
 	}
 	if err := json.Unmarshal(data, &wrapper); err == nil && len(wrapper.Accounts) > 0 {
 		configs = wrapper.Accounts
@@ -172,6 +176,7 @@ func LoadAccountsFromJSON(filePath string) (*ParsedConfig, error) {
 		Accounts:      accounts,
 		Replication:   replication,
 		SubjectPrefix: wrapper.SubjectPrefix,
+		RemoveSent:    wrapper.RemoveSent,
 	}, nil
 }
 
@@ -194,6 +199,7 @@ func LoadAccountsFromEncryptedJSON(filePath string, password string) (*ParsedCon
 		Accounts      []AccountConfig `json:"accounts"`
 		Replication   int             `json:"replication"`
 		SubjectPrefix string          `json:"subject_prefix"`
+		RemoveSent    bool            `json:"remove_sent"`
 	}
 	if err := json.Unmarshal(decrypted, &wrapper); err == nil && len(wrapper.Accounts) > 0 {
 		configs = wrapper.Accounts
@@ -221,11 +227,12 @@ func LoadAccountsFromEncryptedJSON(filePath string, password string) (*ParsedCon
 		Accounts:      accounts,
 		Replication:   replication,
 		SubjectPrefix: wrapper.SubjectPrefix,
+		RemoveSent:    wrapper.RemoveSent,
 	}, nil
 }
 
 // SaveAccountsEncrypted saves accounts to a file encrypted with a password
-func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, replication int, subjectPrefix string, password string) error {
+func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, replication int, subjectPrefix string, removeSent bool, password string) error {
 	configs := make([]AccountConfig, len(accounts))
 	for i, acc := range accounts {
 		configs[i] = AccountConfig{
@@ -241,10 +248,12 @@ func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, replication
 		Accounts      []AccountConfig `json:"accounts"`
 		Replication   int             `json:"replication,omitempty"`
 		SubjectPrefix string          `json:"subject_prefix,omitempty"`
+		RemoveSent    bool            `json:"remove_sent,omitempty"`
 	}{
 		Accounts:      configs,
 		Replication:   replication,
 		SubjectPrefix: subjectPrefix,
+		RemoveSent:    removeSent,
 	}
 
 	data, err := json.MarshalIndent(wrapper, "", "  ")
@@ -261,7 +270,7 @@ func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, replication
 }
 
 // SerializeAccounts serializes accounts to JSON bytes (for portable archives)
-func SerializeAccounts(accounts []*MailAccount, replication int, subjectPrefix string) ([]byte, error) {
+func SerializeAccounts(accounts []*MailAccount, replication int, subjectPrefix string, removeSent bool) ([]byte, error) {
 	configs := make([]AccountConfig, len(accounts))
 	for i, acc := range accounts {
 		configs[i] = AccountConfig{
@@ -276,10 +285,12 @@ func SerializeAccounts(accounts []*MailAccount, replication int, subjectPrefix s
 		Accounts      []AccountConfig `json:"accounts"`
 		Replication   int             `json:"replication,omitempty"`
 		SubjectPrefix string          `json:"subject_prefix,omitempty"`
+		RemoveSent    bool            `json:"remove_sent,omitempty"`
 	}{
 		Accounts:      configs,
 		Replication:   replication,
 		SubjectPrefix: subjectPrefix,
+		RemoveSent:    removeSent,
 	}
 	return json.MarshalIndent(wrapper, "", "  ")
 }
@@ -367,10 +378,12 @@ func GenerateConfigTemplate(w io.Writer, numAccounts int) error {
 		Accounts      []AccountConfig `json:"accounts"`
 		Replication   int             `json:"replication"`
 		SubjectPrefix string          `json:"subject_prefix"`
+		RemoveSent    bool            `json:"remove_sent"`
 	}{
 		Accounts:      configs,
 		Replication:   2,
 		SubjectPrefix: "MBOX Blob :",
+		RemoveSent:    true,
 	}
 
 	data, err := json.MarshalIndent(wrapper, "", "  ")
