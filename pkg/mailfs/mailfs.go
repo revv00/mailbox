@@ -514,16 +514,18 @@ func (m *MailFS) findBlobInCloud(accountIdx int, key string) (string, error) {
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(uids[len(uids)-1])
 	messages := make(chan *imap.Message, 1)
+	done := make(chan error, 1)
 
 	// Fetch in background to handle channel
 	go func() {
-		if err := c.Fetch(seqSet, []imap.FetchItem{imap.FetchEnvelope}, messages); err != nil {
-			logger.Warnf("Fetch envelope failed for %d: %v", uids[len(uids)-1], err)
-		}
-		close(messages)
+		done <- c.Fetch(seqSet, []imap.FetchItem{imap.FetchEnvelope}, messages)
 	}()
 
 	msg := <-messages
+	if err := <-done; err != nil {
+		logger.Warnf("Fetch envelope failed for %d: %v", uids[len(uids)-1], err)
+	}
+
 	if msg != nil && msg.Envelope != nil {
 		return msg.Envelope.MessageId, nil
 	}
