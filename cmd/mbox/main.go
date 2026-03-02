@@ -1050,6 +1050,18 @@ func doWipe(c *cli.Context) error {
 		return fmt.Errorf("wipe failed: %w", err)
 	}
 
+	// 4. Wipe Local State
+	home, _ := os.UserHomeDir()
+	statePattern := filepath.Join(home, ".mbox", "state*")
+	matches, _ := filepath.Glob(statePattern)
+	for _, m := range matches {
+		if err := os.RemoveAll(m); err != nil {
+			fmt.Printf("⚠️  Warning: Failed to wipe local state %s: %v\n", filepath.Base(m), err)
+		} else {
+			fmt.Printf("Local resumable state '%s' cleared.\n", filepath.Base(m))
+		}
+	}
+
 	fmt.Println("Wipe complete. All cloud accounts have been cleared of MailFS data.")
 	return nil
 }

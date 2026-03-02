@@ -18,6 +18,7 @@ package mailfs
 
 import (
 	"bytes"
+	"crypto/md5"
 	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
@@ -273,6 +274,7 @@ func (m *MailFS) initDB() error {
 		replica_account INTEGER,
 		msg_id TEXT,
 		replica_msg_id TEXT,
+		hash TEXT,
 		created_at INTEGER
 	);
 	
@@ -282,8 +284,14 @@ func (m *MailFS) initDB() error {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_blobs_created ON blobs(created_at);
+	CREATE INDEX IF NOT EXISTS idx_blobs_hash ON blobs(hash);
 	`
 	_, err := m.db.Exec(schema)
+	if err == nil {
+		// Migration: add hash column if it doesn't exist
+		_, _ = m.db.Exec("ALTER TABLE blobs ADD COLUMN hash TEXT;")
+		_, _ = m.db.Exec("CREATE INDEX IF NOT EXISTS idx_blobs_hash ON blobs(hash);")
+	}
 	return err
 }
 
@@ -850,6 +858,8 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 	row := m.db.QueryRow("SELECT account, replica_account, msg_id, replica_msg_id FROM blobs WHERE key = ?", key)
 	err = row.Scan(&dbAcc, &dbRepAcc, &dbMsgID, &dbRepMsgID)
 
+	contentHash := fmt.Sprintf("%x", md5.Sum(data))
+
 	primaryIdx, replicaIdx := m.getReplicaAccounts(key)
 	var msgID, replicaMsgID string
 	needPrimary := true
@@ -865,6 +875,21 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 			needReplica = false
 			replicaIdx = int(dbRepAcc.Int64)
 			replicaMsgID = dbRepMsgID.String
+		}
+	} else if err == sql.ErrNoRows {
+		// Content-based deduplication: check if we already have this data under a different key
+		var dedupAcc, dedupRepAcc int
+		var dedupMsgID, dedupRepMsgID string
+		errDedup := m.db.QueryRow("SELECT account, replica_account, msg_id, replica_msg_id FROM blobs WHERE hash = ? AND size = ? LIMIT 1",
+			contentHash, int64(len(data))).Scan(&dedupAcc, &dedupRepAcc, &dedupMsgID, &dedupRepMsgID)
+		if errDedup == nil {
+			logger.Infof("[MailFS] Found matching content for %s (hash %s) under another key, reusing", key, contentHash)
+			primaryIdx = dedupAcc
+			replicaIdx = dedupRepAcc
+			msgID = dedupMsgID
+			replicaMsgID = dedupRepMsgID
+			needPrimary = false
+			needReplica = false
 		}
 	}
 
@@ -890,7 +915,7 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 		pErr = err
 		if err == nil {
 			// Early persistence of primary
-			_ = m.updateBlobMetadataInternal(key, int64(len(data)), idx, mid, true)
+			_ = m.updateBlobMetadataInternal(key, int64(len(data)), idx, mid, true, contentHash)
 		}
 	}()
 
@@ -907,7 +932,7 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 			rErr = err
 			if err == nil {
 				// Early persistence of replica
-				_ = m.updateBlobMetadataInternal(key, int64(len(data)), idx, mid, false)
+				_ = m.updateBlobMetadataInternal(key, int64(len(data)), idx, mid, false, contentHash)
 			}
 		}()
 	}
@@ -935,9 +960,9 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 
 	_, err = tx.Exec(
 		`INSERT OR REPLACE INTO blobs 
-		(key, size, mtime, account, replica_account, msg_id, replica_msg_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		key, int64(len(data)), now, finalPrimaryIdx, finalReplicaIdx, msgID, replicaMsgID, now)
+		(key, size, mtime, account, replica_account, msg_id, replica_msg_id, hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		key, int64(len(data)), now, finalPrimaryIdx, finalReplicaIdx, msgID, replicaMsgID, contentHash, now)
 	if err != nil {
 		return err
 	}
@@ -2592,32 +2617,36 @@ func (m *MailFS) wipeFolder(c *client.Client, folderName string, email string) {
 	}
 }
 
-func (m *MailFS) updateBlobMetadataInternal(key string, size int64, accountIdx int, msgID string, isPrimary bool) error {
+func (m *MailFS) updateBlobMetadataInternal(key string, size int64, accountIdx int, msgID string, isPrimary bool, hash string) error {
 	m.Lock()
 	defer m.Unlock()
-
+	// NOTE: This internal helper is used for early persistence.
+	// Since we now have hash-based dedupe, it's better to update everything in the final TX in Put.
+	// But let's keep it working for partial updates.
 	now := time.Now().UnixNano()
 	if isPrimary {
 		_, err := m.db.Exec(`
-			INSERT INTO blobs (key, size, mtime, account, msg_id, created_at)
-			VALUES (?, ?, ?, ?, ?, ?)
+			INSERT INTO blobs (key, size, mtime, account, msg_id, hash, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(key) DO UPDATE SET
 				account=excluded.account,
 				msg_id=excluded.msg_id,
 				size=excluded.size,
-				mtime=excluded.mtime
-		`, key, size, now, accountIdx, msgID, now)
+				mtime=excluded.mtime,
+				hash=excluded.hash
+		`, key, size, now, accountIdx, msgID, hash, now)
 		return err
 	} else {
 		_, err := m.db.Exec(`
-			INSERT INTO blobs (key, size, mtime, replica_account, replica_msg_id, created_at)
-			VALUES (?, ?, ?, ?, ?, ?)
+			INSERT INTO blobs (key, size, mtime, replica_account, replica_msg_id, hash, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(key) DO UPDATE SET
 				replica_account=excluded.replica_account,
 				replica_msg_id=excluded.replica_msg_id,
 				size=excluded.size,
-				mtime=excluded.mtime
-		`, key, size, now, accountIdx, msgID, now)
+				mtime=excluded.mtime,
+				hash=excluded.hash
+		`, key, size, now, accountIdx, msgID, hash, now)
 		return err
 	}
 }

@@ -368,13 +368,6 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 				thisSize = size - offset
 			}
 
-			// If this entire block was already fully committed in a previous run, skip writing it.
-			// This prevents generating new slice versions (e.g. _2), keeping deduplication perfect.
-			if offset+thisSize <= int64(entry.Attr.Length) {
-				fmt.Printf("Block at offset %d (size %d) already committed. Skipping.\n", offset, thisSize)
-				return
-			}
-
 			buf := make([]byte, thisSize)
 			n, rErr := f.ReadAt(buf, offset)
 			if rErr != nil && rErr != io.EOF {
