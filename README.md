@@ -4,11 +4,6 @@ A portable, secure, and extremely simple CLI tool to turn your email accounts in
 
 ---
 
-## 🌟 Acknowledgement & Co-authorship
-`mbox` stands on the shoulders of giants. This project is **co-authored with Gemini 3.0**, whose advanced agentic coding capabilities were instrumental in building and refining this tool.
-
-We also express our deepest gratitude to [JuiceFS](https://github.com/juicedata/juicefs). By leveraging JuiceFS as our metadata and chunking engine, `mbox` inherits industrial‑grade reliability, POSIX‑compatible file handling, and efficient data deduplication while using standard email protocols (IMAP/SMTP) as its "object storage" layer.
-
 ## 🛠 Installation
 If you have Go installed:
 ```bash
@@ -28,7 +23,7 @@ For others, download the latest pre-built binary for your platform (Linux, macOS
 
 ---
 
-## 📖 Usage Guide
+## 📖 User Guide
 
 ### 1. Configuration
 First, set up your email accounts:
@@ -130,6 +125,13 @@ Ideal for documents, source code repositories, or configuration sets.
 | `mbox get` | `unpack` → `mount` → `cp` | Decrypts `.mbox` and restores data locally. |
 | `mbox ls` | `imap search` | Lists .mbox files found in the cloud (first account). |
 | `mbox del` | `rm` + `blob cleanup` | Conceptually wipes local and remote data. |
+
+---
+
+## 🌟 Acknowledgement & Co-authorship
+`mbox` stands on the shoulders of giants. This project is **co-authored with Gemini 3.0**, whose advanced agentic coding capabilities were instrumental in building and refining this tool.
+
+We also express our deepest gratitude to [JuiceFS](https://github.com/juicedata/juicefs). By leveraging JuiceFS as our metadata and chunking engine, `mbox` inherits industrial‑grade reliability, POSIX‑compatible file handling, and efficient data deduplication while using standard email protocols (IMAP/SMTP) as its "object storage" layer.
 
 ---
 
