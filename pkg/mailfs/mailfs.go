@@ -213,8 +213,15 @@ func NewMailFS(cfg config.MailFSConfig) (*MailFS, error) {
 	if cfg.ReplicationFactor == 0 {
 		cfg.ReplicationFactor = 1
 	}
-	if cfg.ReplicationFactor > len(cfg.Accounts) {
-		return nil, fmt.Errorf("replication factor (%d) cannot exceed number of accounts (%d)", cfg.ReplicationFactor, len(cfg.Accounts))
+	// If more than one account, reserve index 0 for mbox files.
+	if len(cfg.Accounts) > 1 {
+		if cfg.ReplicationFactor > len(cfg.Accounts)-1 {
+			return nil, fmt.Errorf("replication factor (%d) cannot exceed number of available blob accounts (%d), since account 0 is reserved for metadata config", cfg.ReplicationFactor, len(cfg.Accounts)-1)
+		}
+	} else {
+		if cfg.ReplicationFactor > len(cfg.Accounts) {
+			return nil, fmt.Errorf("replication factor (%d) cannot exceed number of accounts (%d)", cfg.ReplicationFactor, len(cfg.Accounts))
+		}
 	}
 
 	// Initialize SQLite database
@@ -478,12 +485,22 @@ func (m *MailFS) getReplicaAccounts(key string) (int, int) {
 		return -1, -1
 	}
 
-	primary := hashToAccount(key, numAccounts)
-	if m.config.ReplicationFactor <= 1 || numAccounts == 1 {
+	if numAccounts == 1 {
+		primary := hashToAccount(key, 1)
 		return primary, primary
 	}
 
-	replica := (primary + 1) % numAccounts
+	// Use accounts from index 1 onwards for blobs if more than one account
+	blobAccounts := numAccounts - 1
+	primaryOffset := hashToAccount(key, blobAccounts)
+	primary := 1 + primaryOffset
+
+	if m.config.ReplicationFactor <= 1 || blobAccounts <= 1 {
+		return primary, primary
+	}
+
+	replicaOffset := (primaryOffset + 1) % blobAccounts
+	replica := 1 + replicaOffset
 	return primary, replica
 }
 
@@ -510,10 +527,17 @@ func (m *MailFS) findBlobInCloud(accountIdx int, key string) (string, error) {
 		return "", err
 	}
 
-	// Fetch Envelope for the latest one to get Message-ID
+	// Fetch Envelopes for candidates and find exact match
+	// SEARCH SUBJECT is a substring match, so "chunks/1_0" matches "chunks/1_00"
+	searchLimit := 20
+	if len(uids) < searchLimit {
+		searchLimit = len(uids)
+	}
+	candidates := uids[len(uids)-searchLimit:]
 	seqSet := new(imap.SeqSet)
-	seqSet.AddNum(uids[len(uids)-1])
-	messages := make(chan *imap.Message, 1)
+	seqSet.AddNum(candidates...)
+
+	messages := make(chan *imap.Message, searchLimit)
 	done := make(chan error, 1)
 
 	// Fetch in background to handle channel
@@ -521,14 +545,23 @@ func (m *MailFS) findBlobInCloud(accountIdx int, key string) (string, error) {
 		done <- c.Fetch(seqSet, []imap.FetchItem{imap.FetchEnvelope}, messages)
 	}()
 
-	msg := <-messages
+	var results []*imap.Message
+	for msg := range messages {
+		results = append(results, msg)
+	}
 	if err := <-done; err != nil {
-		logger.Warnf("Fetch envelope failed for %d: %v", uids[len(uids)-1], err)
+		logger.Warnf("Candidate fetch failed for key %s: %v", key, err)
 	}
 
-	if msg != nil && msg.Envelope != nil {
-		return msg.Envelope.MessageId, nil
+	expectedSubject := m.config.SubjectPrefix + key
+	// Iterate backwards to find the most recent exact match
+	for i := len(results) - 1; i >= 0; i-- {
+		msg := results[i]
+		if msg != nil && msg.Envelope != nil && msg.Envelope.Subject == expectedSubject {
+			return msg.Envelope.MessageId, nil
+		}
 	}
+
 	return "", nil
 }
 
@@ -743,6 +776,9 @@ func (m *MailFS) storeWithRetry(initialIdx int, otherIdx int, key string, data [
 		if i == initialIdx || i == otherIdx {
 			continue
 		}
+		if len(m.accounts) > 1 && i == 0 {
+			continue // Skip account 0 which is reserved for mbox files
+		}
 		if getDomain(m.accounts[i].Email) != initialDomain {
 			alternatives = append(alternatives, i)
 		}
@@ -751,6 +787,9 @@ func (m *MailFS) storeWithRetry(initialIdx int, otherIdx int, key string, data [
 	for i := range m.accounts {
 		if i == initialIdx || i == otherIdx {
 			continue
+		}
+		if len(m.accounts) > 1 && i == 0 {
+			continue // Skip account 0 which is reserved for mbox files
 		}
 		if getDomain(m.accounts[i].Email) == initialDomain {
 			alternatives = append(alternatives, i)
@@ -1269,7 +1308,7 @@ func (m *MailFS) DownloadMBox(filename string) ([]byte, error) {
 	}
 
 	searchKey := "MBox Config: " + filename
-	seqNum, err := m.findMsgUIDClientSide(c, searchKey)
+	seqNum, err := m.findMsgUIDClientSide(c, searchKey, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1340,7 +1379,7 @@ func (m *MailFS) DeleteMBox(filename string) error {
 	}
 
 	searchKey := "MBox Config: " + filename
-	seqNum, err := m.findMsgUID(c, searchKey)
+	seqNum, err := m.findMsgUID(c, searchKey, false)
 	if err != nil {
 		return err
 	}
@@ -1391,7 +1430,7 @@ func (m *MailFS) fetchFromEmail(accountIdx int, msgID string, key string) ([]byt
 
 	// 2. If not found, fallback to search by key in subject
 	if seqNum == 0 {
-		seqNum, err = m.findMsgUID(c, key)
+		seqNum, err = m.findMsgUID(c, key, true)
 		if err != nil {
 			return nil, fmt.Errorf("search failed: %w", err)
 		}
@@ -1505,22 +1544,26 @@ func (m *MailFS) rawSearchSubject(c *client.Client, key string) ([]uint32, error
 }
 
 // Helper function to find a message by key
-func (m *MailFS) findMsgUID(c *client.Client, key string) (uint32, error) {
+func (m *MailFS) findMsgUID(c *client.Client, key string, isBlob bool) (uint32, error) {
 	// 1. SELECT INBOX
 	_, err := c.Select("INBOX", false)
 	if err != nil {
 		return 0, fmt.Errorf("select failed: %w", err)
 	}
 
-	// 2. Try Raw Server-Side Search
-	ids, err := m.rawSearchSubject(c, key)
-	if err != nil {
-		logger.Warnf("Raw search failed: %v", err)
-		// Fallback code would go here
+	expectedSubject := key
+	if isBlob {
+		expectedSubject = m.config.SubjectPrefix + key
 	}
 
-	// 3. Fallback: Search for broad terms if specific key search failed
-	if len(ids) == 0 {
+	// 2. Try Raw Server-Side Search
+	ids, err := m.rawSearchSubject(c, expectedSubject)
+	if err != nil {
+		logger.Warnf("Raw search failed: %v", err)
+	}
+
+	// 3. Fallback for blobs: Search for broad terms if specific key search failed
+	if len(ids) == 0 && isBlob {
 		// Try configurations prefix first
 		searchTerm := strings.TrimSpace(strings.ReplaceAll(m.config.SubjectPrefix, ":", ""))
 		if searchTerm != "" {
@@ -1575,9 +1618,13 @@ func (m *MailFS) findMsgUID(c *client.Client, key string) (uint32, error) {
 
 	var confirmedUID uint32
 	for msg := range messages {
+		expectedSubject := key
+		if isBlob {
+			expectedSubject = m.config.SubjectPrefix + key
+		}
 		// Priority 1: Use decoded Envelope Subject
 		if msg.Envelope != nil {
-			if strings.Contains(msg.Envelope.Subject, key) {
+			if msg.Envelope.Subject == expectedSubject {
 				confirmedUID = msg.SeqNum
 				continue
 			}
@@ -1587,7 +1634,8 @@ func (m *MailFS) findMsgUID(c *client.Client, key string) (uint32, error) {
 		r := msg.GetBody(section)
 		if r != nil {
 			buf, _ := io.ReadAll(r)
-			if strings.Contains(string(buf), key) {
+			subjectHeader := string(buf)
+			if strings.Contains(subjectHeader, expectedSubject) {
 				confirmedUID = msg.SeqNum
 			}
 		}
@@ -1600,7 +1648,7 @@ func (m *MailFS) findMsgUID(c *client.Client, key string) (uint32, error) {
 	return confirmedUID, nil
 }
 
-func (m *MailFS) findMsgUIDClientSide0(c *client.Client, key string) (uint32, error) {
+func (m *MailFS) findMsgUIDClientSide0(c *client.Client, key string, isBlob bool) (uint32, error) {
 	// 1. SELECT INBOX
 	// We must select INBOX because that is where SMTP delivers new blobs.
 	mbox, err := c.Select("INBOX", false)
@@ -1652,7 +1700,11 @@ func (m *MailFS) findMsgUIDClientSide0(c *client.Client, key string) (uint32, er
 		// Since you save blobs as "<prefix><key>", checking for the key here is safe.
 		// strings.Contains is fast and avoids all server-side tokenization issues.
 		// logger.Infof("Checking message SeqNum %d with msg: %v", msg.SeqNum, msg)
-		if strings.Contains(msg.Envelope.Subject, key) {
+		expectedSubject := key
+		if isBlob {
+			expectedSubject = m.config.SubjectPrefix + key
+		}
+		if msg.Envelope.Subject == expectedSubject {
 			// Found it! We update foundSeqNum.
 			// We keep looping to find the *highest* SeqNum (most recent) if duplicates exist.
 			foundSeqNum = msg.SeqNum
@@ -1673,7 +1725,7 @@ func (m *MailFS) findMsgUIDClientSide0(c *client.Client, key string) (uint32, er
 	return foundSeqNum, nil
 }
 
-func (m *MailFS) findMsgUIDClientSide(c *client.Client, key string) (uint32, error) {
+func (m *MailFS) findMsgUIDClientSide(c *client.Client, key string, isBlob bool) (uint32, error) {
 	// 1. SELECT INBOX
 	mbox, err := c.Select("INBOX", false)
 	if err != nil {
@@ -1730,9 +1782,13 @@ func (m *MailFS) findMsgUIDClientSide(c *client.Client, key string) (uint32, err
 		headerStr := string(headerBytes)
 
 		// logger.Infof("Checking msg %d raw header: %q", msg.SeqNum, headerStr)
+		expectedSubject := key
+		if isBlob {
+			expectedSubject = m.config.SubjectPrefix + key
+		}
 
-		// Simple string check
-		if strings.Contains(headerStr, key) {
+		// Check for the full subject string (including prefix)
+		if strings.Contains(headerStr, expectedSubject) {
 			foundSeqNum = msg.SeqNum
 		}
 	}
@@ -1857,7 +1913,7 @@ func (m *MailFS) Delete(key string, getters ...object.AttrGetter) error {
 				id, _ = m.findMsgByMessageID(c, targetMsgID)
 			}
 			if id == 0 {
-				id, _ = m.findMsgUID(c, key)
+				id, _ = m.findMsgUID(c, key, true)
 			}
 
 			if id == 0 {
@@ -1966,7 +2022,7 @@ func (m *MailFS) BatchDelete(keys []string) error {
 					id, _ = m.findMsgByMessageID(c, msgID)
 				}
 				if id == 0 {
-					id, _ = m.findMsgUID(c, info.key)
+					id, _ = m.findMsgUID(c, info.key, true)
 				}
 
 				if id != 0 {

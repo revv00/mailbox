@@ -225,7 +225,7 @@ func LoadAccountsFromEncryptedJSON(filePath string, password string) (*ParsedCon
 }
 
 // SaveAccountsEncrypted saves accounts to a file encrypted with a password
-func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, replication int, password string) error {
+func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, replication int, subjectPrefix string, password string) error {
 	configs := make([]AccountConfig, len(accounts))
 	for i, acc := range accounts {
 		configs[i] = AccountConfig{
@@ -244,7 +244,7 @@ func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, replication
 	}{
 		Accounts:      configs,
 		Replication:   replication,
-		SubjectPrefix: "MBOX Blob :", // Default for new configs
+		SubjectPrefix: subjectPrefix,
 	}
 
 	data, err := json.MarshalIndent(wrapper, "", "  ")
@@ -261,7 +261,7 @@ func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, replication
 }
 
 // SerializeAccounts serializes accounts to JSON bytes (for portable archives)
-func SerializeAccounts(accounts []*MailAccount, replication int) ([]byte, error) {
+func SerializeAccounts(accounts []*MailAccount, replication int, subjectPrefix string) ([]byte, error) {
 	configs := make([]AccountConfig, len(accounts))
 	for i, acc := range accounts {
 		configs[i] = AccountConfig{
@@ -273,11 +273,13 @@ func SerializeAccounts(accounts []*MailAccount, replication int) ([]byte, error)
 		}
 	}
 	wrapper := struct {
-		Accounts    []AccountConfig `json:"accounts"`
-		Replication int             `json:"replication,omitempty"`
+		Accounts      []AccountConfig `json:"accounts"`
+		Replication   int             `json:"replication,omitempty"`
+		SubjectPrefix string          `json:"subject_prefix,omitempty"`
 	}{
-		Accounts:    configs,
-		Replication: replication,
+		Accounts:      configs,
+		Replication:   replication,
+		SubjectPrefix: subjectPrefix,
 	}
 	return json.MarshalIndent(wrapper, "", "  ")
 }
