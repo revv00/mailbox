@@ -116,7 +116,7 @@ func NewMBoxClient(dbPath string, conf *config.ParsedConfig, noCache bool, paral
 		Chunk: &chunkConf,
 		FuseOpts: &vfs.FuseOptions{
 			EnableWriteback: false,
-			MaxWrite:        16 * 1024 * 1024,
+			MaxWrite:        64 * 1024 * 1024,
 		},
 	}, m, store, nil, nil)
 
@@ -341,14 +341,14 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 		return fmt.Errorf("create %s failed: %v", vPath, errno)
 	}
 
-	const blockSize = 16 * 1024 * 1024 // Step by JuiceFS block size for optimal parallel hashing/staging
+	const vfsWriteSize = 64 * 1024 * 1024 // Step by JuiceFS chunk size for optimal parallel chunking
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var firstErr error
 
-	fmt.Printf("Uploading %s (%d bytes) in %d blocks (parallelism: %d)...\n", localPath, size, (size+blockSize-1)/blockSize, c.parallel)
+	fmt.Printf("Uploading %s (%d bytes) in %d blocks (parallelism: %d)...\n", localPath, size, (size+vfsWriteSize-1)/vfsWriteSize, c.parallel)
 
-	for off := int64(0); off < size; off += blockSize {
+	for off := int64(0); off < size; off += vfsWriteSize {
 		wg.Add(1)
 		go func(offset int64) {
 			defer wg.Done()
@@ -363,7 +363,7 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 			}
 			errMu.Unlock()
 
-			thisSize := int64(blockSize)
+			thisSize := int64(vfsWriteSize)
 			if offset+thisSize > size {
 				thisSize = size - offset
 			}
@@ -525,12 +525,12 @@ func (c *MBoxClient) exportFile(ino vfs.Ino, localPath string, size uint64) erro
 	}
 	defer c.vfs.Release(c.auth, entry.Inode, fh)
 
-	const blockSize = 16 * 1024 * 1024
+	const vfsWriteSize = 64 * 1024 * 1024
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var firstErr error
 
-	for off := uint64(0); off < size; off += uint64(blockSize) {
+	for off := uint64(0); off < size; off += uint64(vfsWriteSize) {
 		wg.Add(1)
 		go func(offset uint64) {
 			defer wg.Done()
@@ -545,7 +545,7 @@ func (c *MBoxClient) exportFile(ino vfs.Ino, localPath string, size uint64) erro
 			}
 			errMu.Unlock()
 
-			thisSize := uint64(blockSize)
+			thisSize := uint64(vfsWriteSize)
 			if offset+thisSize > size {
 				thisSize = size - offset
 			}
