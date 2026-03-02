@@ -9,21 +9,26 @@ jobs:
   release:
     name: Build and Release
     runs-on: ubuntu-latest
+    container:
+      image: goreleaser/goreleaser-cross:v1.23
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
+      - name: Fix git safe.directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Diagnostic - List files
+        run: |
+          pwd
+          ls -R include/fuse
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
-          distribution: goreleaser-cross
+          distribution: goreleaser
           version: latest
           args: release --clean
         env:

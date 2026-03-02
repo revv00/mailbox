@@ -5,69 +5,72 @@ before:
     - go mod tidy
 
 builds:
-  - id: mbox-lite
+  - id: mbox-lite-linux-amd64
     main: ./cmd/mbox
     binary: mbox-lite
     env:
       - CGO_ENABLED=1
-    tags:
-      - nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,nobadger,noetcd,nocifs,notrace,nometrics,nos3
-    ldflags:
-      - -s -w -X github.com/revv00/mailfs/pkg/version.Revision={{.ShortCommit}} -X github.com/revv00/mailfs/pkg/version.RevisionDate={{.Date}}
     goos:
       - linux
-      - windows
-      - darwin
     goarch:
       - amd64
-      - arm64
-    ignore:
-      - goos: windows
-        goarch: arm64
-    hooks:
-      pre:
-        - id: windows-fuse-include
-          # This is a bit tricky since goreleaser-cross handles CC and CGO_CFLAGS.
-          # We might need to handle this in the GHA workflow or using specific env vars in builds if needed.
-          # For windows, the Makefile uses CGO_CFLAGS="-I$(DOCKER_WORKDIR)/include/fuse"
-          # goreleaser allows env overrides per build, but we can't easily distinguish windows-amd64 here without a separate build id or a matrix.
-    # We'll split builds if env needs to be significantly different.
-    # However, let's try a single build with conditional env if possible, 
-    # but Goreleaser builds list is usually better for different CGO requirements.
+    tags: &tags
+      - nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,nobadger,noetcd,nocifs,notrace,nometrics,nos3
+    ldflags: &ldflags
+      - -s -w -X github.com/revv00/mailfs/pkg/version.Revision={{.ShortCommit}} -X github.com/revv00/mailfs/pkg/version.RevisionDate={{.Date}}
 
-  - id: mbox-lite-windows
+  - id: mbox-lite-linux-arm64
     main: ./cmd/mbox
     binary: mbox-lite
     env:
       - CGO_ENABLED=1
-      # CC and CGO_CFLAGS will be provided by goreleaser-cross or the runner environment.
-      # But we can try to set them here if we know the architecture.
-      # For now, let's assume the GHA runner/container handles CC.
-      - CGO_CFLAGS="-I./include/fuse"
-    tags:
-      - nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,nobadger,noetcd,nocifs,notrace,nometrics,nos3
-    ldflags:
-      - -s -w -X github.com/revv00/mailfs/pkg/version.Revision={{.ShortCommit}} -X github.com/revv00/mailfs/pkg/version.RevisionDate={{.Date}}
+      - CC=aarch64-linux-gnu-gcc
+    goos:
+      - linux
+    goarch:
+      - arm64
+    tags: *tags
+    ldflags: *ldflags
+
+  - id: mbox-lite-windows-amd64
+    main: ./cmd/mbox
+    binary: mbox-lite
+    env:
+      - CGO_ENABLED=1
+      - CC=x86_64-w64-mingw32-gcc
+      - CGO_CFLAGS=-I./include/fuse
     goos:
       - windows
     goarch:
       - amd64
+    tags: *tags
+    ldflags: *ldflags
 
-  - id: mbox-lite-unix
+  - id: mbox-lite-darwin-amd64
     main: ./cmd/mbox
     binary: mbox-lite
     env:
       - CGO_ENABLED=1
-    tags:
-      - nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,nobadger,noetcd,nocifs,notrace,nometrics,nos3
-    ldflags:
-      - -s -w -X github.com/revv00/mailfs/pkg/version.Revision={{.ShortCommit}} -X github.com/revv00/mailfs/pkg/version.RevisionDate={{.Date}}
+      - CC=o64-clang
     goos:
-      - linux
       - darwin
     goarch:
       - amd64
+    tags: *tags
+    ldflags: *ldflags
+
+  - id: mbox-lite-darwin-arm64
+    main: ./cmd/mbox
+    binary: mbox-lite
+    env:
+      - CGO_ENABLED=1
+      - CC=oa64-clang
+    goos:
+      - darwin
+    goarch:
       - arm64
+    tags: *tags
+    ldflags: *ldflags
 
 archives:
   - format: tar.gz
