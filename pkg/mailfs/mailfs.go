@@ -275,6 +275,7 @@ func (m *MailFS) initDB() error {
 		msg_id TEXT,
 		replica_msg_id TEXT,
 		hash TEXT,
+		source_key TEXT,
 		created_at INTEGER
 	);
 	
@@ -287,12 +288,15 @@ func (m *MailFS) initDB() error {
 	CREATE INDEX IF NOT EXISTS idx_blobs_hash ON blobs(hash);
 	`
 	_, err := m.db.Exec(schema)
-	if err == nil {
-		// Migration: add hash column if it doesn't exist
-		_, _ = m.db.Exec("ALTER TABLE blobs ADD COLUMN hash TEXT;")
-		_, _ = m.db.Exec("CREATE INDEX IF NOT EXISTS idx_blobs_hash ON blobs(hash);")
+	if err != nil {
+		return err
 	}
-	return err
+	// Migration: add hash column if it doesn't exist
+	_, _ = m.db.Exec("ALTER TABLE blobs ADD COLUMN hash TEXT;")
+	_, _ = m.db.Exec("CREATE INDEX IF NOT EXISTS idx_blobs_hash ON blobs(hash);")
+	// Migration: Add source_key if not exists
+	_, _ = m.db.Exec("ALTER TABLE blobs ADD COLUMN source_key TEXT;")
+	return nil
 }
 
 func (m *MailFS) initIMAPConnections() error {
@@ -644,17 +648,18 @@ func (m *MailFS) Get(key string, off, limit int64, getters ...object.AttrGetter)
 	var replicaIdx sql.NullInt64
 	var primaryMsgID string
 	var replicaMsgID sql.NullString
+	var sourceKey sql.NullString
 	var dataBytes []byte
 
 	logger.Infof("[MailFS] Get key: %s, off: %d, limit: %d", key, off, limit)
 
 	row := m.db.QueryRow(
-		`SELECT account, replica_account, msg_id, replica_msg_id, data 
+		`SELECT account, replica_account, msg_id, replica_msg_id, source_key, data 
 		 FROM blobs 
 		 LEFT JOIN blob_data ON blobs.key = blob_data.key 
 		 WHERE blobs.key = ?`, key)
 
-	err := row.Scan(&primaryIdx, &replicaIdx, &primaryMsgID, &replicaMsgID, &dataBytes)
+	err := row.Scan(&primaryIdx, &replicaIdx, &primaryMsgID, &replicaMsgID, &sourceKey, &dataBytes)
 	if err == sql.ErrNoRows {
 		return nil, os.ErrNotExist
 	}
@@ -682,8 +687,16 @@ func (m *MailFS) Get(key string, off, limit int64, getters ...object.AttrGetter)
 
 	// 4. Fallback: Fetch from IMAP
 	logger.Infof("[MailFS] Blob %s not in local DB, fetching from IMAP (primary: %d)", key, primaryIdx)
+
+	// Determine the effective key to search for in mail subjects.
+	// We use the sourceKey if available (from content deduplication).
+	searchKey := key
+	if sourceKey.Valid && sourceKey.String != "" {
+		searchKey = sourceKey.String
+	}
+
 	unlock := m.lockAccounts(primaryIdx)
-	data, err = m.fetchFromEmail(primaryIdx, primaryMsgID, key)
+	data, err = m.fetchFromEmail(primaryIdx, primaryMsgID, searchKey)
 	unlock()
 
 	if err != nil {
@@ -691,7 +704,7 @@ func (m *MailFS) Get(key string, off, limit int64, getters ...object.AttrGetter)
 			repIdx := int(replicaIdx.Int64)
 			logger.Warnf("Primary fetch failed for %s (acc %d), trying replica (acc %d): %v", key, primaryIdx, repIdx, err)
 			unlockRep := m.lockAccounts(repIdx)
-			data, err = m.fetchFromEmail(repIdx, replicaMsgID.String, key)
+			data, err = m.fetchFromEmail(repIdx, replicaMsgID.String, searchKey)
 			unlockRep()
 		}
 	}
@@ -908,7 +921,7 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 	contentHash := fmt.Sprintf("%x", md5.Sum(data))
 
 	primaryIdx, replicaIdx := m.getReplicaAccounts(key)
-	var msgID, replicaMsgID string
+	var msgID, replicaMsgID, sourceKey string
 	needPrimary := true
 	needReplica := m.config.ReplicationFactor > 1
 
@@ -926,21 +939,25 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 	} else if err == sql.ErrNoRows {
 		// Content-based deduplication: check if we already have this data under a different key
 		var dedupAcc, dedupRepAcc int
-		var dedupMsgID, dedupRepMsgID string
-		errDedup := m.db.QueryRow("SELECT account, replica_account, msg_id, replica_msg_id FROM blobs WHERE hash = ? AND size = ? LIMIT 1",
-			contentHash, int64(len(data))).Scan(&dedupAcc, &dedupRepAcc, &dedupMsgID, &dedupRepMsgID)
+		var dedupMsgID, dedupRepMsgID, dedupKey string
+		errDedup := m.db.QueryRow("SELECT account, replica_account, msg_id, replica_msg_id, key FROM blobs WHERE hash = ? AND size = ? LIMIT 1",
+			contentHash, int64(len(data))).Scan(&dedupAcc, &dedupRepAcc, &dedupMsgID, &dedupRepMsgID, &dedupKey)
 		if errDedup == nil {
-			logger.Infof("[MailFS] Found matching content for %s (hash %s) under another key, reusing", key, contentHash)
+			logger.Infof("[MailFS] Found matching content for %s (hash %s) under another key (%s), reusing", key, contentHash, dedupKey)
 			primaryIdx = dedupAcc
 			replicaIdx = dedupRepAcc
 			msgID = dedupMsgID
 			replicaMsgID = dedupRepMsgID
+			sourceKey = dedupKey
 			needPrimary = false
 			needReplica = false
 		}
 	}
 
-	if !needPrimary && !needReplica {
+	// Only return early if the key ALREADY existed in our local database and has all required replicas.
+	// If it was found via content-hash deduplication (different key), we must proceed to the DB update.
+	keyAlreadyInDB := (err == nil)
+	if !needPrimary && !needReplica && keyAlreadyInDB {
 		logger.Infof("[MailFS] Blob %s already exists in local record, skipping", key)
 		return nil
 	}
@@ -962,7 +979,7 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 		pErr = err
 		if err == nil {
 			// Early persistence of primary
-			_ = m.updateBlobMetadataInternal(key, int64(len(data)), idx, mid, true, contentHash)
+			_ = m.updateBlobMetadataInternal(key, int64(len(data)), idx, mid, true, contentHash, sourceKey)
 		}
 	}()
 
@@ -979,7 +996,7 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 			rErr = err
 			if err == nil {
 				// Early persistence of replica
-				_ = m.updateBlobMetadataInternal(key, int64(len(data)), idx, mid, false, contentHash)
+				_ = m.updateBlobMetadataInternal(key, int64(len(data)), idx, mid, false, contentHash, sourceKey)
 			}
 		}()
 	}
@@ -1007,9 +1024,9 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 
 	_, err = tx.Exec(
 		`INSERT OR REPLACE INTO blobs 
-		(key, size, mtime, account, replica_account, msg_id, replica_msg_id, hash, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		key, int64(len(data)), now, finalPrimaryIdx, finalReplicaIdx, msgID, replicaMsgID, contentHash, now)
+		(key, size, mtime, account, replica_account, msg_id, replica_msg_id, hash, source_key, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		key, int64(len(data)), now, finalPrimaryIdx, finalReplicaIdx, msgID, replicaMsgID, contentHash, sourceKey, now)
 	if err != nil {
 		return err
 	}
@@ -2664,7 +2681,7 @@ func (m *MailFS) wipeFolder(c *client.Client, folderName string, email string) {
 	}
 }
 
-func (m *MailFS) updateBlobMetadataInternal(key string, size int64, accountIdx int, msgID string, isPrimary bool, hash string) error {
+func (m *MailFS) updateBlobMetadataInternal(key string, size int64, accountIdx int, msgID string, isPrimary bool, hash string, sourceKey string) error {
 	m.Lock()
 	defer m.Unlock()
 	// NOTE: This internal helper is used for early persistence.
@@ -2673,27 +2690,29 @@ func (m *MailFS) updateBlobMetadataInternal(key string, size int64, accountIdx i
 	now := time.Now().UnixNano()
 	if isPrimary {
 		_, err := m.db.Exec(`
-			INSERT INTO blobs (key, size, mtime, account, msg_id, hash, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO blobs (key, size, mtime, account, msg_id, hash, source_key, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(key) DO UPDATE SET
 				account=excluded.account,
 				msg_id=excluded.msg_id,
 				size=excluded.size,
 				mtime=excluded.mtime,
-				hash=excluded.hash
-		`, key, size, now, accountIdx, msgID, hash, now)
+				hash=excluded.hash,
+				source_key=excluded.source_key
+		`, key, size, now, accountIdx, msgID, hash, sourceKey, now)
 		return err
 	} else {
 		_, err := m.db.Exec(`
-			INSERT INTO blobs (key, size, mtime, replica_account, replica_msg_id, hash, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO blobs (key, size, mtime, replica_account, replica_msg_id, hash, source_key, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(key) DO UPDATE SET
 				replica_account=excluded.replica_account,
 				replica_msg_id=excluded.replica_msg_id,
 				size=excluded.size,
 				mtime=excluded.mtime,
-				hash=excluded.hash
-		`, key, size, now, accountIdx, msgID, hash, now)
+				hash=excluded.hash,
+				source_key=excluded.source_key
+		`, key, size, now, accountIdx, msgID, hash, sourceKey, now)
 		return err
 	}
 }
