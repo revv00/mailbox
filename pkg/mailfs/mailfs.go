@@ -668,6 +668,64 @@ func (m *MailFS) readRange(data []byte, off, limit int64) io.ReadCloser {
 	return io.NopCloser(bytes.NewBuffer(append([]byte{}, data...)))
 }
 
+func (m *MailFS) storeWithRetry(initialIdx int, otherIdx int, key string, data []byte) (int, string, error) {
+	// 1. Try initialIdx
+	msgID, err := func() (string, error) {
+		unlock := m.lockAccounts(initialIdx)
+		defer unlock()
+		return m.storeInEmail(initialIdx, key, data)
+	}()
+	if err == nil {
+		return initialIdx, msgID, nil
+	}
+
+	logger.Warnf("Failed to store in account %d (%s) for key %s: %v. Trying alternatives...",
+		initialIdx, m.accounts[initialIdx].Email, key, err)
+
+	// Find alternatives
+	var alternatives []int
+	initialDomain := getDomain(m.accounts[initialIdx].Email)
+
+	// Sort accounts by "distance":
+	// 1. Different domain (provider)
+	for i := range m.accounts {
+		if i == initialIdx || i == otherIdx {
+			continue
+		}
+		if getDomain(m.accounts[i].Email) != initialDomain {
+			alternatives = append(alternatives, i)
+		}
+	}
+	// 2. Same domain (but different account)
+	for i := range m.accounts {
+		if i == initialIdx || i == otherIdx {
+			continue
+		}
+		if getDomain(m.accounts[i].Email) == initialDomain {
+			alternatives = append(alternatives, i)
+		}
+	}
+
+	var lastErr error = err
+	for _, altIdx := range alternatives {
+		mid, err := func() (string, error) {
+			unlock := m.lockAccounts(altIdx)
+			defer unlock()
+			return m.storeInEmail(altIdx, key, data)
+		}()
+		if err == nil {
+			logger.Infof("Successfully used alternative account %d (%s) for key %s",
+				altIdx, m.accounts[altIdx].Email, key)
+			return altIdx, mid, nil
+		}
+		logger.Warnf("Failed to store in alternative account %d (%s) for key %s: %v",
+			altIdx, m.accounts[altIdx].Email, key, err)
+		lastErr = err
+	}
+
+	return initialIdx, "", lastErr
+}
+
 func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) error {
 	logger.Infof("[MailFS] Put start: %s", key)
 	m.wg.Add(1)
@@ -683,26 +741,29 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 
 	primaryIdx, replicaIdx := m.getReplicaAccounts(key)
 
-	// Ensure serialized access to the accounts involved
-	unlock := m.lockAccounts(primaryIdx, replicaIdx)
-	defer unlock()
-
 	// 1 & 2. Upload to Email (Primary and Replica in Parallel)
 	var msgID, replicaMsgID string
 	var pErr, rErr error
 	var uploadWg sync.WaitGroup
+	finalPrimaryIdx, finalReplicaIdx := primaryIdx, replicaIdx
 
 	uploadWg.Add(1)
 	go func() {
 		defer uploadWg.Done()
-		msgID, pErr = m.storeInEmail(primaryIdx, key, data)
+		idx, mid, err := m.storeWithRetry(primaryIdx, replicaIdx, key, data)
+		finalPrimaryIdx = idx
+		msgID = mid
+		pErr = err
 	}()
 
 	if replicaIdx != primaryIdx {
 		uploadWg.Add(1)
 		go func() {
 			defer uploadWg.Done()
-			replicaMsgID, rErr = m.storeInEmail(replicaIdx, key, data)
+			idx, mid, err := m.storeWithRetry(replicaIdx, primaryIdx, key, data)
+			finalReplicaIdx = idx
+			replicaMsgID = mid
+			rErr = err
 		}()
 	}
 
@@ -727,12 +788,11 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 
 	now := time.Now().UnixNano()
 
-	// Update Metadata
 	_, err = tx.Exec(
 		`INSERT OR REPLACE INTO blobs 
 		(key, size, mtime, account, replica_account, msg_id, replica_msg_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		key, int64(len(data)), now, primaryIdx, replicaIdx, msgID, replicaMsgID, now)
+		key, int64(len(data)), now, finalPrimaryIdx, finalReplicaIdx, msgID, replicaMsgID, now)
 	if err != nil {
 		return err
 	}
@@ -757,8 +817,8 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 		size:           int64(len(data)),
 		mtime:          time.Unix(0, now),
 		data:           data,
-		account:        primaryIdx,
-		replicaAccount: replicaIdx,
+		account:        finalPrimaryIdx,
+		replicaAccount: finalReplicaIdx,
 		msgID:          msgID,
 		replicaMsgID:   replicaMsgID,
 	}
