@@ -18,7 +18,6 @@ package mailfs
 
 import (
 	"bytes"
-	"context"
 	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
@@ -28,6 +27,7 @@ import (
 	"net"
 	"net/smtp"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -45,7 +45,7 @@ var logger = utils.GetLogger("mailfs")
 
 type DefaultObjectStorage struct{}
 
-func (s DefaultObjectStorage) Create(ctx context.Context) error {
+func (s DefaultObjectStorage) Create() error {
 	return nil
 }
 
@@ -53,53 +53,53 @@ func (s DefaultObjectStorage) Limits() object.Limits {
 	return object.Limits{IsSupportMultipartUpload: false, IsSupportUploadPartCopy: false}
 }
 
-func (s DefaultObjectStorage) Head(ctx context.Context, key string) (object.Object, error) {
+func (s DefaultObjectStorage) Head(key string) (object.Object, error) {
 	return nil, errors.New("not supported")
 }
 
-func (s DefaultObjectStorage) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+func (s DefaultObjectStorage) Get(key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
 	return nil, errors.New("not supported")
 }
 
-func (s DefaultObjectStorage) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+func (s DefaultObjectStorage) Put(key string, in io.Reader, getters ...object.AttrGetter) error {
 	return errors.New("not supported")
 }
 
-func (s DefaultObjectStorage) Copy(ctx context.Context, dst, src string) error {
+func (s DefaultObjectStorage) Copy(dst, src string) error {
 	return errors.New("not supported")
 }
 
-func (s DefaultObjectStorage) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
+func (s DefaultObjectStorage) Delete(key string, getters ...object.AttrGetter) error {
 	return errors.New("not supported")
 }
 
-func (s DefaultObjectStorage) CreateMultipartUpload(ctx context.Context, key string) (*object.MultipartUpload, error) {
+func (s DefaultObjectStorage) CreateMultipartUpload(key string) (*object.MultipartUpload, error) {
 	return nil, errors.New("not supported")
 }
 
-func (s DefaultObjectStorage) UploadPart(ctx context.Context, key string, uploadID string, num int, body []byte) (*object.Part, error) {
+func (s DefaultObjectStorage) UploadPart(key string, uploadID string, num int, body []byte) (*object.Part, error) {
 	return nil, errors.New("not supported")
 }
 
-func (s DefaultObjectStorage) UploadPartCopy(ctx context.Context, key string, uploadID string, num int, srcKey string, off, size int64) (*object.Part, error) {
+func (s DefaultObjectStorage) UploadPartCopy(key string, uploadID string, num int, srcKey string, off, size int64) (*object.Part, error) {
 	return nil, errors.New("not supported")
 }
 
-func (s DefaultObjectStorage) AbortUpload(ctx context.Context, key string, uploadID string) {}
+func (s DefaultObjectStorage) AbortUpload(key string, uploadID string) {}
 
-func (s DefaultObjectStorage) CompleteUpload(ctx context.Context, key string, uploadID string, parts []*object.Part) error {
+func (s DefaultObjectStorage) CompleteUpload(key string, uploadID string, parts []*object.Part) error {
 	return errors.New("not supported")
 }
 
-func (s DefaultObjectStorage) ListUploads(ctx context.Context, marker string) ([]*object.PendingPart, string, error) {
+func (s DefaultObjectStorage) ListUploads(marker string) ([]*object.PendingPart, string, error) {
 	return nil, "", nil
 }
 
-func (s DefaultObjectStorage) List(ctx context.Context, prefix, start, token, delimiter string, limit int64, followLink bool) ([]object.Object, bool, string, error) {
+func (s DefaultObjectStorage) List(prefix, start, token, delimiter string, limit int64, followLink bool) ([]object.Object, bool, string, error) {
 	return nil, false, "", errors.New("not supported")
 }
 
-func (s DefaultObjectStorage) ListAll(ctx context.Context, prefix, marker string, followLink bool) (<-chan object.Object, error) {
+func (s DefaultObjectStorage) ListAll(prefix, marker string, followLink bool) (<-chan object.Object, error) {
 	return nil, errors.New("not supported")
 }
 
@@ -177,7 +177,7 @@ type safeIMAPClient struct {
 	c *client.Client
 }
 
-type mailFS struct {
+type MailFS struct {
 	sync.RWMutex
 	DefaultObjectStorage // Embeds the interface implementation
 
@@ -189,7 +189,7 @@ type mailFS struct {
 }
 
 // NewMailFS creates a new mailFS instance
-func NewMailFS(cfg config.MailFSConfig) (*mailFS, error) {
+func NewMailFS(cfg config.MailFSConfig) (*MailFS, error) {
 	// Validate configuration
 	if len(cfg.Accounts) == 0 {
 		return nil, errors.New("at least one email account is required")
@@ -211,7 +211,7 @@ func NewMailFS(cfg config.MailFSConfig) (*mailFS, error) {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}
 
-	mfs := &mailFS{
+	mfs := &MailFS{
 		config:      cfg,
 		db:          db,
 		accounts:    cfg.Accounts,
@@ -233,8 +233,13 @@ func NewMailFS(cfg config.MailFSConfig) (*mailFS, error) {
 	return mfs, nil
 }
 
-// initDB initializes SQLite schema
-func (m *mailFS) initDB() error {
+// initDB initializes SQLite schema and sets pragmas
+func (m *MailFS) initDB() error {
+	// Disable WAL mode for portable archives. Default DELETE/TRUNCATE mode
+	// ensures all data is in the main .db file when the database is closed.
+	_, _ = m.db.Exec("PRAGMA journal_mode=DELETE;")
+	_, _ = m.db.Exec("PRAGMA synchronous=NORMAL;")
+
 	schema := `
 	CREATE TABLE IF NOT EXISTS blobs (
 		key TEXT PRIMARY KEY,
@@ -249,14 +254,16 @@ func (m *mailFS) initDB() error {
 	
 	CREATE TABLE IF NOT EXISTS blob_data (
 		key TEXT PRIMARY KEY,
-		data TEXT
+		data BLOB
 	);
+
+	CREATE INDEX IF NOT EXISTS idx_blobs_created ON blobs(created_at);
 	`
 	_, err := m.db.Exec(schema)
 	return err
 }
 
-func (m *mailFS) initIMAPConnections() error {
+func (m *MailFS) initIMAPConnections() error {
 	skipVerify := os.Getenv("MAILFS_SKIP_TLS_VERIFY") == "1"
 
 	// Legacy CipherSuites required for older mail providers (Sina, 163, etc.)
@@ -353,11 +360,11 @@ func (m *mailFS) initIMAPConnections() error {
 	return nil
 }
 
-func (m *mailFS) String() string {
+func (m *MailFS) String() string {
 	return fmt.Sprintf("mailfs://%d-accounts/", len(m.accounts))
 }
 
-func (m *mailFS) Limits() object.Limits {
+func (m *MailFS) Limits() object.Limits {
 	return object.Limits{
 		IsSupportMultipartUpload: false,
 		IsSupportUploadPartCopy:  false,
@@ -366,7 +373,7 @@ func (m *mailFS) Limits() object.Limits {
 	}
 }
 
-func (m *mailFS) Create(ctx context.Context) error { return nil }
+func (m *MailFS) Create() error { return nil }
 
 // hashToAccount is a helper to distribute keys across accounts.
 // It is exported implicitly to the test file in the same package.
@@ -384,7 +391,7 @@ func hashToAccount(key string, numAccounts int) int {
 	return h % numAccounts
 }
 
-func (m *mailFS) getReplicaAccounts(key string) (int, int) {
+func (m *MailFS) getReplicaAccounts(key string) (int, int) {
 	numAccounts := len(m.accounts)
 	if numAccounts == 0 {
 		return -1, -1
@@ -399,7 +406,7 @@ func (m *mailFS) getReplicaAccounts(key string) (int, int) {
 	return primary, replica
 }
 
-func (m *mailFS) lockAccounts(indices ...int) func() {
+func (m *MailFS) lockAccounts(indices ...int) func() {
 	var sorted []int
 	unique := make(map[int]bool)
 	for _, idx := range indices {
@@ -421,7 +428,7 @@ func (m *mailFS) lockAccounts(indices ...int) func() {
 	}
 }
 
-func (m *mailFS) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+func (m *MailFS) Get(key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
 	m.RLock()
 	// 1. Memory Cache
 	if blob, ok := m.blobCache[key]; ok {
@@ -435,15 +442,17 @@ func (m *mailFS) Get(ctx context.Context, key string, off, limit int64, getters 
 	var replicaIdx sql.NullInt64
 	var primaryMsgID string
 	var replicaMsgID sql.NullString
-	var encodedData sql.NullString
+	var dataBytes []byte
 
-	row := m.db.QueryRowContext(ctx,
+	logger.Infof("[MailFS] Get key: %s, off: %d, limit: %d", key, off, limit)
+
+	row := m.db.QueryRow(
 		`SELECT account, replica_account, msg_id, replica_msg_id, data 
 		 FROM blobs 
 		 LEFT JOIN blob_data ON blobs.key = blob_data.key 
 		 WHERE blobs.key = ?`, key)
 
-	err := row.Scan(&primaryIdx, &replicaIdx, &primaryMsgID, &replicaMsgID, &encodedData)
+	err := row.Scan(&primaryIdx, &replicaIdx, &primaryMsgID, &replicaMsgID, &dataBytes)
 	if err == sql.ErrNoRows {
 		return nil, os.ErrNotExist
 	}
@@ -454,18 +463,25 @@ func (m *mailFS) Get(ctx context.Context, key string, off, limit int64, getters 
 	var data []byte
 
 	// 3. If Data in Local DB, use it
-	if encodedData.Valid && encodedData.String != "" {
-		data, err = base64.StdEncoding.DecodeString(encodedData.String)
-		if err == nil {
+	if dataBytes != nil {
+		data = dataBytes
+		if len(data) > 0 {
+			// Check if it's base64 (for backward compatibility)
+			if len(data)%4 == 0 && isBase64(string(data)) {
+				decoded, err := base64.StdEncoding.DecodeString(string(data))
+				if err == nil {
+					data = decoded
+				}
+			}
 			logger.Infof("Loaded blob %s from local cache database", key)
 			return m.readRange(data, off, limit), nil
 		}
-		logger.Warnf("Failed to decode local data for %s, falling back to IMAP: %v", key, err)
 	}
 
 	// 4. Fallback: Fetch from IMAP
+	logger.Infof("[MailFS] Blob %s not in local DB, fetching from IMAP (primary: %d)", key, primaryIdx)
 	unlock := m.lockAccounts(primaryIdx)
-	data, err = m.fetchFromEmail(ctx, primaryIdx, primaryMsgID, key)
+	data, err = m.fetchFromEmail(primaryIdx, primaryMsgID, key)
 	unlock()
 
 	if err != nil {
@@ -473,7 +489,7 @@ func (m *mailFS) Get(ctx context.Context, key string, off, limit int64, getters 
 			repIdx := int(replicaIdx.Int64)
 			logger.Warnf("Primary fetch failed for %s (acc %d), trying replica (acc %d): %v", key, primaryIdx, repIdx, err)
 			unlockRep := m.lockAccounts(repIdx)
-			data, err = m.fetchFromEmail(ctx, repIdx, replicaMsgID.String, key)
+			data, err = m.fetchFromEmail(repIdx, replicaMsgID.String, key)
 			unlockRep()
 		}
 	}
@@ -485,7 +501,7 @@ func (m *mailFS) Get(ctx context.Context, key string, off, limit int64, getters 
 	return m.readRange(data, off, limit), nil
 }
 
-func (m *mailFS) readRange(data []byte, off, limit int64) io.ReadCloser {
+func (m *MailFS) readRange(data []byte, off, limit int64) io.ReadCloser {
 	if off > int64(len(data)) {
 		off = int64(len(data))
 	}
@@ -496,7 +512,7 @@ func (m *mailFS) readRange(data []byte, off, limit int64) io.ReadCloser {
 	return io.NopCloser(bytes.NewBuffer(append([]byte{}, data...)))
 }
 
-func (m *mailFS) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) error {
 	if key == "" {
 		return errors.New("key cannot be empty")
 	}
@@ -513,7 +529,7 @@ func (m *mailFS) Put(ctx context.Context, key string, in io.Reader, getters ...o
 	defer unlock()
 
 	// 1. Upload to Email (Primary)
-	msgID, err := m.storeInEmail(ctx, primaryIdx, key, data)
+	msgID, err := m.storeInEmail(primaryIdx, key, data)
 	if err != nil {
 		return fmt.Errorf("failed to store primary replica: %w", err)
 	}
@@ -521,7 +537,7 @@ func (m *mailFS) Put(ctx context.Context, key string, in io.Reader, getters ...o
 	// 2. Upload to Email (Replica) - Best effort
 	var replicaMsgID string
 	if replicaIdx != primaryIdx {
-		rid, rErr := m.storeInEmail(ctx, replicaIdx, key, data)
+		rid, rErr := m.storeInEmail(replicaIdx, key, data)
 		if rErr != nil {
 			logger.Warnf("Replica upload failed for %s: %v", key, rErr)
 		} else {
@@ -533,17 +549,16 @@ func (m *mailFS) Put(ctx context.Context, key string, in io.Reader, getters ...o
 	m.Lock()
 	defer m.Unlock()
 
-	tx, err := m.db.BeginTx(ctx, nil)
+	tx, err := m.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
 	now := time.Now().UnixNano()
-	encodedData := base64.StdEncoding.EncodeToString(data)
 
 	// Update Metadata
-	_, err = tx.ExecContext(ctx,
+	_, err = tx.Exec(
 		`INSERT OR REPLACE INTO blobs 
 		(key, size, mtime, account, replica_account, msg_id, replica_msg_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -552,12 +567,14 @@ func (m *mailFS) Put(ctx context.Context, key string, in io.Reader, getters ...o
 		return err
 	}
 
-	// Store Data if small/needed (here we store everything in blob_data for simplicity)
-	_, err = tx.ExecContext(ctx,
-		`INSERT OR REPLACE INTO blob_data (key, data) VALUES (?, ?)`,
-		key, encodedData)
-	if err != nil {
-		return err
+	// Store Data if small/needed
+	if !m.config.NoCache {
+		_, err = tx.Exec(
+			`INSERT OR REPLACE INTO blob_data (key, data) VALUES (?, ?)`,
+			key, data)
+		if err != nil {
+			return err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -579,7 +596,7 @@ func (m *mailFS) Put(ctx context.Context, key string, in io.Reader, getters ...o
 	return nil
 }
 
-func (m *mailFS) storeInEmail(ctx context.Context, accountIdx int, key string, data []byte) (string, error) {
+func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, error) {
 	if accountIdx >= len(m.accounts) {
 		return "", fmt.Errorf("invalid account index %d", accountIdx)
 	}
@@ -647,12 +664,15 @@ func (m *mailFS) storeInEmail(ctx context.Context, accountIdx int, key string, d
 	// 4. Construct Content
 	boundary := fmt.Sprintf("JUICEFS_BOUNDARY_%d", time.Now().UnixNano())
 	subject := fmt.Sprintf("JuiceFS Blob :%s", key)
+	// Generate a unique Message-ID for reliable searching
+	msgID := fmt.Sprintf("<juicefs-%s-%d@mailfs.local>", key, time.Now().UnixNano())
 	encodedBlob := base64.StdEncoding.EncodeToString(data)
 
 	body := new(bytes.Buffer)
 	fmt.Fprintf(body, "From: %s\r\n", acc.Email)
 	fmt.Fprintf(body, "To: %s\r\n", acc.Email)
 	fmt.Fprintf(body, "Subject: %s\r\n", subject)
+	fmt.Fprintf(body, "Message-ID: %s\r\n", msgID)
 	fmt.Fprintf(body, "X-JuiceFS-Key: %s\r\n", key)
 	fmt.Fprintf(body, "MIME-Version: 1.0\r\n")
 	fmt.Fprintf(body, "Content-Type: multipart/mixed; boundary=%s\r\n\r\n", boundary)
@@ -686,6 +706,7 @@ func (m *mailFS) storeInEmail(ctx context.Context, accountIdx int, key string, d
 	}
 
 	if _, err = w.Write(body.Bytes()); err != nil {
+		w.Close()
 		return "", fmt.Errorf("writing body failed: %w", err)
 	}
 
@@ -693,11 +714,246 @@ func (m *mailFS) storeInEmail(ctx context.Context, accountIdx int, key string, d
 		return "", fmt.Errorf("closing data writer failed: %w", err)
 	}
 
-	logger.Infof("[SMTP] Successfully stored blob %s in email", key)
-	return "", nil
+	logger.Infof("[SMTP] Successfully stored blob %s in email (MsgID: %s)", key, msgID)
+	return msgID, nil
 }
 
-func (m *mailFS) fetchFromEmail(ctx context.Context, accountIdx int, msgID string, key string) ([]byte, error) {
+// UploadMBox uploads an encrypted .mbox file to the specified account.
+func (m *MailFS) UploadMBox(filename string, data []byte) error {
+	subject := fmt.Sprintf("MBox Config: %s", filename)
+	return m.storeGenericFile(subject, filename, data)
+}
+
+func (m *MailFS) storeGenericFile(subject string, filename string, data []byte) error {
+	// For simplicity, we use account 0 for config storage
+	accountIdx := 0
+	acc := m.accounts[accountIdx]
+
+	host, port, err := net.SplitHostPort(acc.SMTPHost)
+	if err != nil {
+		host = acc.SMTPHost
+		port = "465"
+	}
+	addr := net.JoinHostPort(host, port)
+
+	tlsConfig := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: os.Getenv("MAILFS_SKIP_TLS_VERIFY") == "1",
+		MinVersion:         tls.VersionTLS10,
+	}
+
+	var c *smtp.Client
+	if port == "465" {
+		conn, err := tls.Dial("tcp", addr, tlsConfig)
+		if err != nil {
+			return err
+		}
+		c, err = smtp.NewClient(conn, host)
+		if err != nil {
+			conn.Close()
+			return err
+		}
+	} else {
+		c, err = smtp.Dial(addr)
+		if err != nil {
+			return err
+		}
+		if ok, _ := c.Extension("STARTTLS"); ok {
+			if err = c.StartTLS(tlsConfig); err != nil {
+				c.Close()
+				return err
+			}
+		}
+	}
+	defer c.Quit()
+
+	auth := smtp.PlainAuth("", acc.Email, acc.Password, host)
+	if err = c.Auth(auth); err != nil {
+		return err
+	}
+
+	boundary := fmt.Sprintf("MBOX_BOUNDARY_%d", time.Now().UnixNano())
+	encodedData := base64.StdEncoding.EncodeToString(data)
+
+	body := new(bytes.Buffer)
+	fmt.Fprintf(body, "From: %s\r\n", acc.Email)
+	fmt.Fprintf(body, "To: %s\r\n", acc.Email)
+	fmt.Fprintf(body, "Subject: %s\r\n", subject)
+	fmt.Fprintf(body, "MIME-Version: 1.0\r\n")
+	fmt.Fprintf(body, "Content-Type: multipart/mixed; boundary=%s\r\n\r\n", boundary)
+
+	body.WriteString("--" + boundary + "\r\n")
+	body.WriteString("Content-Type: application/octet-stream\r\n")
+	body.WriteString("Content-Transfer-Encoding: base64\r\n")
+	fmt.Fprintf(body, "Content-Disposition: attachment; filename=\"%s\"\r\n\r\n", filename)
+	body.WriteString(encodedData)
+	body.WriteString("\r\n--" + boundary + "--\r\n")
+
+	if err = c.Mail(acc.Email); err != nil {
+		return err
+	}
+	if err = c.Rcpt(acc.Email); err != nil {
+		return err
+	}
+	w, err := c.Data()
+	if err != nil {
+		return err
+	}
+	_, _ = w.Write(body.Bytes())
+	return w.Close()
+}
+
+// ListMBoxes lists all .mbox files matching the pattern in the specified account.
+func (m *MailFS) ListMBoxes(pattern string) ([]string, error) {
+	// Using account 0 for config storage
+	accountIdx := 0
+	if accountIdx >= len(m.imapClients) || m.imapClients[accountIdx] == nil {
+		return nil, errors.New("IMAP client not initialized")
+	}
+
+	safeClient := m.imapClients[accountIdx]
+	safeClient.Lock()
+	defer safeClient.Unlock()
+
+	c := safeClient.c
+	mboxInfo, err := c.Select("INBOX", true)
+	if err != nil {
+		return nil, err
+	}
+
+	if mboxInfo.Messages == 0 {
+		return nil, nil
+	}
+
+	const searchDepth = 500
+	from := uint32(1)
+	if mboxInfo.Messages > searchDepth {
+		from = mboxInfo.Messages - searchDepth + 1
+	}
+	to := mboxInfo.Messages
+
+	seqSet := new(imap.SeqSet)
+	seqSet.AddRange(from, to)
+
+	section := &imap.BodySectionName{
+		BodyPartName: imap.BodyPartName{
+			Specifier: imap.HeaderSpecifier,
+			Fields:    []string{"Subject"},
+		},
+		Peek: true,
+	}
+
+	messages := make(chan *imap.Message, searchDepth)
+	done := make(chan error, 1)
+
+	go func() {
+		done <- c.Fetch(seqSet, []imap.FetchItem{section.FetchItem()}, messages)
+	}()
+
+	var results []string
+	prefix := "MBox Config: "
+	for msg := range messages {
+		r := msg.GetBody(section)
+		if r == nil {
+			continue
+		}
+		buf, _ := io.ReadAll(r)
+		subjectLine := string(buf)
+
+		if strings.Contains(subjectLine, prefix) {
+			idx := strings.Index(subjectLine, prefix)
+			fname := strings.TrimSpace(subjectLine[idx+len(prefix):])
+			fname = strings.Fields(fname)[0]
+
+			matched, _ := filepath.Match(pattern, fname)
+			if pattern == "" || pattern == "*" || matched || fname == pattern {
+				results = append(results, fname)
+			}
+		}
+	}
+
+	if err := <-done; err != nil {
+		return nil, err
+	}
+
+	return results, nil
+}
+
+// DownloadMBox downloads an encrypted .mbox file from the specified account.
+func (m *MailFS) DownloadMBox(filename string) ([]byte, error) {
+	accountIdx := 0
+	if accountIdx >= len(m.imapClients) || m.imapClients[accountIdx] == nil {
+		return nil, errors.New("IMAP client not initialized")
+	}
+
+	safeClient := m.imapClients[accountIdx]
+	safeClient.Lock()
+	defer safeClient.Unlock()
+
+	c := safeClient.c
+	_, err := c.Select("INBOX", false)
+	if err != nil {
+		return nil, err
+	}
+
+	searchKey := "MBox Config: " + filename
+	seqNum, err := m.findMsgUIDClientSide(c, searchKey)
+	if err != nil {
+		return nil, err
+	}
+	if seqNum == 0 {
+		return nil, os.ErrNotExist
+	}
+
+	seqSet := new(imap.SeqSet)
+	seqSet.AddNum(seqNum)
+	section := &imap.BodySectionName{}
+	messages := make(chan *imap.Message, 1)
+	done := make(chan error, 1)
+
+	go func() {
+		done <- c.Fetch(seqSet, []imap.FetchItem{section.FetchItem()}, messages)
+	}()
+
+	msg := <-messages
+	if err := <-done; err != nil {
+		return nil, err
+	}
+	if msg == nil {
+		return nil, os.ErrNotExist
+	}
+
+	r := msg.GetBody(section)
+	fullBody, _ := io.ReadAll(r)
+
+	parts := bytes.Split(fullBody, []byte("Content-Transfer-Encoding: base64"))
+	if len(parts) < 2 {
+		return nil, errors.New("could not find base64 part")
+	}
+
+	blobPart := parts[1]
+	if headerEnd := bytes.Index(blobPart, []byte("\r\n\r\n")); headerEnd != -1 {
+		blobPart = blobPart[headerEnd+4:]
+	} else if headerEnd := bytes.Index(blobPart, []byte("\n\n")); headerEnd != -1 {
+		blobPart = blobPart[headerEnd+2:]
+	}
+
+	if idx := bytes.Index(blobPart, []byte("--MBOX_BOUNDARY")); idx != -1 {
+		blobPart = blobPart[:idx]
+	}
+
+	cleanBlob := bytes.NewBuffer(make([]byte, 0, len(blobPart)))
+	for _, b := range blobPart {
+		if b != '\r' && b != '\n' && b != ' ' && b != '\t' {
+			cleanBlob.WriteByte(b)
+		}
+	}
+
+	return base64.StdEncoding.DecodeString(cleanBlob.String())
+}
+
+func (m *MailFS) fetchFromEmail(accountIdx int, msgID string, key string) ([]byte, error) {
+	logger.Infof("[MailFS] fetchFromEmail: key=%s, msgID=%s, account=%d", key, msgID, accountIdx)
 	if accountIdx >= len(m.imapClients) || m.imapClients[accountIdx] == nil {
 		return nil, errors.New("IMAP client not initialized")
 	}
@@ -709,12 +965,21 @@ func (m *mailFS) fetchFromEmail(ctx context.Context, accountIdx int, msgID strin
 
 	c := safeClient.c
 
-	// Use the client-side search logic verified in the Delete function.
-	// This ensures consistency: if Delete can find it, Fetch can find it.
-	seqNum, err := m.findMsgUIDClientSide(ctx, c, key)
-	if err != nil {
-		return nil, fmt.Errorf("search failed: %w", err)
+	// 1. Try to find by msgID if available
+	var seqNum uint32
+	var err error
+	if msgID != "" {
+		seqNum, _ = m.findMsgByMessageID(c, msgID)
 	}
+
+	// 2. If not found, fallback to search by key in subject
+	if seqNum == 0 {
+		seqNum, err = m.findMsgUIDClientSide(c, key)
+		if err != nil {
+			return nil, fmt.Errorf("search failed: %w", err)
+		}
+	}
+
 	if seqNum == 0 {
 		return nil, os.ErrNotExist
 	}
@@ -748,24 +1013,31 @@ func (m *mailFS) fetchFromEmail(ctx context.Context, accountIdx int, msgID strin
 
 	fullBody, _ := io.ReadAll(r)
 
-	// Existing parsing logic to extract the specific blob part
-	parts := bytes.Split(fullBody, []byte("Content-Transfer-Encoding: base64"))
-	if len(parts) < 2 {
+	// Existing parsing logic to extract the specific base64 part
+	// We look for the part that has application/octet-stream or just after the encoding header
+	targetMarker := []byte("Content-Transfer-Encoding: base64")
+	idx := bytes.Index(fullBody, targetMarker)
+	if idx == -1 {
 		return nil, errors.New("could not find base64 part in email")
 	}
 
-	blobPart := parts[1]
-	// Skip potential headers in the same part (like Content-Disposition)
+	blobPart := fullBody[idx+len(targetMarker):]
+	// Skip the header-body separator (\r\n\r\n or \n\n)
 	if headerEnd := bytes.Index(blobPart, []byte("\r\n\r\n")); headerEnd != -1 {
 		blobPart = blobPart[headerEnd+4:]
 	} else if headerEnd := bytes.Index(blobPart, []byte("\n\n")); headerEnd != -1 {
 		blobPart = blobPart[headerEnd+2:]
 	} else {
-		blobPart = bytes.TrimLeft(blobPart, "\r\n")
+		// Just trim whitespace if no double newline found
+		blobPart = bytes.TrimLeft(blobPart, "\r\n ")
 	}
 
-	if idx := bytes.Index(blobPart, []byte("--JUICEFS_BOUNDARY")); idx != -1 {
-		blobPart = blobPart[:idx]
+	// Truncate at boundary
+	if bIdx := bytes.Index(blobPart, []byte("--JUICEFS_BOUNDARY")); bIdx != -1 {
+		blobPart = blobPart[:bIdx]
+	} else if bIdx := bytes.Index(blobPart, []byte("\r\n--")); bIdx != -1 {
+		// Fallback for any other boundary
+		blobPart = blobPart[:bIdx]
 	}
 
 	// Remove all whitespace (including newlines, spaces, etc)
@@ -784,7 +1056,7 @@ func (m *mailFS) fetchFromEmail(ctx context.Context, accountIdx int, msgID strin
 	return decoded, nil
 }
 
-func (m *mailFS) rawSearchSubject(c *client.Client, key string) ([]uint32, error) {
+func (m *MailFS) rawSearchSubject(c *client.Client, key string) ([]uint32, error) {
 	cmd := &imap.Command{
 		Name: "SEARCH",
 		Arguments: []interface{}{
@@ -833,7 +1105,7 @@ func (m *mailFS) rawSearchSubject(c *client.Client, key string) ([]uint32, error
 }
 
 // Helper function to find a message by key
-func (m *mailFS) findMsgUID(ctx context.Context, c *client.Client, key string) (uint32, error) {
+func (m *MailFS) findMsgUID(c *client.Client, key string) (uint32, error) {
 	// 1. SELECT INBOX
 	_, err := c.Select("INBOX", false)
 	if err != nil {
@@ -900,7 +1172,7 @@ func (m *mailFS) findMsgUID(ctx context.Context, c *client.Client, key string) (
 	return confirmedUID, nil
 }
 
-func (m *mailFS) findMsgUIDClientSide0(ctx context.Context, c *client.Client, key string) (uint32, error) {
+func (m *MailFS) findMsgUIDClientSide0(c *client.Client, key string) (uint32, error) {
 	// 1. SELECT INBOX
 	// We must select INBOX because that is where SMTP delivers new blobs.
 	mbox, err := c.Select("INBOX", false)
@@ -973,7 +1245,7 @@ func (m *mailFS) findMsgUIDClientSide0(ctx context.Context, c *client.Client, ke
 	return foundSeqNum, nil
 }
 
-func (m *mailFS) findMsgUIDClientSide(ctx context.Context, c *client.Client, key string) (uint32, error) {
+func (m *MailFS) findMsgUIDClientSide(c *client.Client, key string) (uint32, error) {
 	// 1. SELECT INBOX
 	mbox, err := c.Select("INBOX", false)
 	if err != nil {
@@ -1049,20 +1321,68 @@ func (m *mailFS) findMsgUIDClientSide(ctx context.Context, c *client.Client, key
 	return foundSeqNum, nil
 }
 
+func (m *MailFS) findMsgByMessageID(c *client.Client, msgID string) (uint32, error) {
+	// messageID is like "<juicefs-...@mailfs.local>"
+	// We use server-side SEARCH for Message-ID if supported, or fall back to client-side.
+	cmd := &imap.Command{
+		Name: "SEARCH",
+		Arguments: []interface{}{
+			"HEADER", "Message-ID", msgID,
+		},
+	}
+
+	var uids []uint32
+	handler := genericHandler{
+		handle: func(resp imap.Resp) error {
+			data, ok := resp.(*imap.DataResp)
+			if !ok || len(data.Fields) < 2 || data.Fields[0] != "SEARCH" {
+				return nil
+			}
+			for _, field := range data.Fields[1:] {
+				if num, err := imap.ParseNumber(field); err == nil {
+					uids = append(uids, num)
+				}
+			}
+			return nil
+		},
+	}
+
+	status, err := c.Execute(cmd, handler)
+	if err == nil && status.Type == "OK" && len(uids) > 0 {
+		return uids[len(uids)-1], nil
+	}
+
+	return 0, os.ErrNotExist
+}
+
+func isBase64(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=') {
+			return false
+		}
+	}
+	return true
+}
+
 // Simple helper for Go < 1.18
 func contains(s, substr string) bool {
 	// import "strings"
 	return strings.Contains(s, substr)
 }
 
-func (m *mailFS) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
+func (m *MailFS) Delete(key string, getters ...object.AttrGetter) error {
 	m.Lock()
 	defer m.Unlock()
 
 	// 1. Find account info from DB metadata
 	var primaryIdx int
 	var replicaIdx sql.NullInt64
-	err := m.db.QueryRowContext(ctx, "SELECT account, replica_account FROM blobs WHERE key = ?", key).Scan(&primaryIdx, &replicaIdx)
+	var primaryMsgID string
+	var replicaMsgID sql.NullString
+	err := m.db.QueryRow("SELECT account, replica_account, msg_id, replica_msg_id FROM blobs WHERE key = ?", key).Scan(&primaryIdx, &replicaIdx, &primaryMsgID, &replicaMsgID)
 
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -1074,21 +1394,31 @@ func (m *mailFS) Delete(ctx context.Context, key string, getters ...object.AttrG
 	}
 
 	// 2. Physical Deletion from Email Accounts
-	accountsToDelete := []int{primaryIdx}
+	type accToDelete struct {
+		idx   int
+		msgID string
+	}
+	var targets []accToDelete
+	targets = append(targets, accToDelete{primaryIdx, primaryMsgID})
 	if replicaIdx.Valid && int(replicaIdx.Int64) != primaryIdx {
-		accountsToDelete = append(accountsToDelete, int(replicaIdx.Int64))
+		targets = append(targets, accToDelete{int(replicaIdx.Int64), replicaMsgID.String})
 	}
 
-	unlock := m.lockAccounts(accountsToDelete...)
+	indices := make([]int, len(targets))
+	for i, t := range targets {
+		indices[i] = t.idx
+	}
+	unlock := m.lockAccounts(indices...)
 	defer unlock()
 
-	for _, idx := range accountsToDelete {
+	for _, target := range targets {
+		idx := target.idx
 		if idx >= len(m.imapClients) || m.imapClients[idx] == nil {
 			continue
 		}
 
 		// Run deletion for this account
-		err := func(accIdx int) error {
+		err := func(accIdx int, targetMsgID string) error {
 			safeClient := m.imapClients[accIdx]
 			acc := m.accounts[accIdx]
 
@@ -1096,18 +1426,20 @@ func (m *mailFS) Delete(ctx context.Context, key string, getters ...object.AttrG
 			defer safeClient.Unlock()
 
 			c := safeClient.c
-			id, err := m.findMsgUIDClientSide(ctx, c, key)
-			if err != nil {
-				logger.Errorf("[DELETE] Search error for %s: %v", key, err)
-				return err
+			var id uint32
+			if targetMsgID != "" {
+				id, _ = m.findMsgByMessageID(c, targetMsgID)
+			}
+			if id == 0 {
+				id, _ = m.findMsgUIDClientSide(c, key)
 			}
 
 			if id == 0 {
-				logger.Warnf("[DELETE] Blob %s not found on server %s", key, acc.Email)
+				logger.Warnf("[DELETE] Blob %s (MsgID: %s) not found on server %s", key, targetMsgID, acc.Email)
 				return nil
 			}
-			ids := []uint32{id}
 
+			ids := []uint32{id}
 			seqSet := new(imap.SeqSet)
 			seqSet.AddNum(ids...)
 			item := imap.FormatFlagsOp(imap.AddFlags, true)
@@ -1123,7 +1455,7 @@ func (m *mailFS) Delete(ctx context.Context, key string, getters ...object.AttrG
 
 			logger.Infof("[DELETE] Successfully wiped blob %s from %s", key, acc.Email)
 			return nil
-		}(idx)
+		}(idx, target.msgID)
 
 		if err != nil {
 			logger.Errorf("[DELETE] Error deleting from account %d: %v", idx, err)
@@ -1132,13 +1464,13 @@ func (m *mailFS) Delete(ctx context.Context, key string, getters ...object.AttrG
 
 	// 3. Final Step: Cleanup local metadata and cache
 	delete(m.blobCache, key)
-	_, _ = m.db.ExecContext(ctx, "DELETE FROM blobs WHERE key = ?", key)
-	_, _ = m.db.ExecContext(ctx, "DELETE FROM blob_data WHERE key = ?", key)
+	_, _ = m.db.Exec("DELETE FROM blobs WHERE key = ?", key)
+	_, _ = m.db.Exec("DELETE FROM blob_data WHERE key = ?", key)
 
 	return nil
 }
 
-func (m *mailFS) Head(ctx context.Context, key string) (object.Object, error) {
+func (m *MailFS) Head(key string) (object.Object, error) {
 	m.RLock()
 	defer m.RUnlock()
 
@@ -1153,8 +1485,7 @@ func (m *mailFS) Head(ctx context.Context, key string) (object.Object, error) {
 
 	var size int64
 	var mtime int64
-	err := m.db.QueryRowContext(ctx,
-		`SELECT size, mtime FROM blobs WHERE key = ?`, key).Scan(&size, &mtime)
+	err := m.db.QueryRow(`SELECT size, mtime FROM blobs WHERE key = ?`, key).Scan(&size, &mtime)
 
 	if err == sql.ErrNoRows {
 		return nil, os.ErrNotExist
@@ -1171,23 +1502,29 @@ func (m *mailFS) Head(ctx context.Context, key string) (object.Object, error) {
 	}, nil
 }
 
-func (m *mailFS) Copy(ctx context.Context, dst, src string) error {
-	d, err := m.Get(ctx, src, 0, -1)
+func (m *MailFS) Copy(dst, src string) error {
+	d, err := m.Get(src, 0, -1)
 	if err != nil {
 		return err
 	}
 	defer d.Close()
-	return m.Put(ctx, dst, d)
+	return m.Put(dst, d)
 }
 
-func (m *mailFS) List(ctx context.Context, prefix, marker, token, delimiter string, limit int64, followLink bool) ([]object.Object, bool, string, error) {
+func (m *MailFS) List(prefix, marker, token, delimiter string, limit int64, followLink bool) ([]object.Object, bool, string, error) {
 	m.RLock()
 	defer m.RUnlock()
 
 	var objs []object.Object
-	rows, err := m.db.QueryContext(ctx,
-		`SELECT key, size, mtime FROM blobs WHERE key >= ? AND key LIKE ? ORDER BY key LIMIT ?`,
-		marker, prefix+"%", limit+1)
+	var rows *sql.Rows
+	var err error
+
+	if marker != "" {
+		rows, err = m.db.Query(`SELECT key, size, mtime FROM blobs WHERE key > ? AND key LIKE ? ORDER BY key LIMIT ?`, marker, prefix+"%", limit+1)
+	} else {
+		rows, err = m.db.Query(`SELECT key, size, mtime FROM blobs WHERE key LIKE ? ORDER BY key LIMIT ?`, prefix+"%", limit+1)
+	}
+
 	if err != nil {
 		return nil, false, "", err
 	}
@@ -1210,18 +1547,18 @@ func (m *mailFS) List(ctx context.Context, prefix, marker, token, delimiter stri
 	hasMore := false
 	if len(objs) > int(limit) {
 		hasMore = true
-		objs = objs[:len(objs)-1]
 		nextMarker = objs[len(objs)-1].Key()
+		objs = objs[:len(objs)-1]
 	}
 
 	return objs, hasMore, nextMarker, nil
 }
 
-func (m *mailFS) ListAll(ctx context.Context, prefix, marker string, followLink bool) (<-chan object.Object, error) {
+func (m *MailFS) ListAll(prefix, marker string, followLink bool) (<-chan object.Object, error) {
 	ch := make(chan object.Object)
 	go func() {
 		defer close(ch)
-		objs, _, _, _ := m.List(ctx, prefix, marker, "", "", 1000000, false)
+		objs, _, _, _ := m.List(prefix, marker, "", "", 1000000, false)
 		for _, o := range objs {
 			ch <- o
 		}
@@ -1229,7 +1566,18 @@ func (m *mailFS) ListAll(ctx context.Context, prefix, marker string, followLink 
 	return ch, nil
 }
 
-func (m *mailFS) Close() error {
+func (m *MailFS) CloseDB() error {
+	m.Lock()
+	defer m.Unlock()
+	if m.db != nil {
+		err := m.db.Close()
+		m.db = nil
+		return err
+	}
+	return nil
+}
+
+func (m *MailFS) Close() error {
 	m.Lock()
 	defer m.Unlock()
 	for _, sc := range m.imapClients {
@@ -1237,5 +1585,8 @@ func (m *mailFS) Close() error {
 			sc.c.Logout()
 		}
 	}
-	return m.db.Close()
+	if m.db != nil {
+		return m.db.Close()
+	}
+	return nil
 }

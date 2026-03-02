@@ -23,6 +23,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/revv00/mailfs/pkg/crypto"
 )
 
 // MailAccount represents email configuration for storing blobs
@@ -49,6 +51,7 @@ type MailFSConfig struct {
 	DBPath            string // SQLite database path for metadata
 	BlobFolder        string // Folder prefix for blobs in email
 	ReplicationFactor int    // Number of replicas per chunk
+	NoCache           bool   // If true, data is not stored in local DB
 }
 
 // MailProvider represents common email providers with preset configurations
@@ -90,12 +93,17 @@ var Providers = map[string]MailProvider{
 	"163": {
 		Name:     "NetEase 163",
 		IMAPHost: "imap.163.com:993",
-		SMTPHost: "smtp.163.com:587",
+		SMTPHost: "smtp.163.com:465",
 	},
 	"qq": {
 		Name:     "QQ Mail",
 		IMAPHost: "imap.qq.com:993",
 		SMTPHost: "smtp.qq.com:587",
+	},
+	"sina": {
+		Name:     "Sina Mail",
+		IMAPHost: "imap.sina.com:993",
+		SMTPHost: "smtp.sina.com:465",
 	},
 }
 
@@ -145,6 +153,97 @@ func LoadAccountsFromJSON(filePath string) ([]*MailAccount, error) {
 	}
 
 	return accounts, nil
+}
+
+// LoadAccountsFromEncryptedJSON loads email accounts from an encrypted JSON file
+func LoadAccountsFromEncryptedJSON(filePath string, password string) ([]*MailAccount, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	// Try decrypting
+	decrypted, err := crypto.Decrypt(password, data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt config: %w", err)
+	}
+
+	var configs []AccountConfig
+	var wrapper struct {
+		Accounts []AccountConfig `json:"accounts"`
+	}
+	if err := json.Unmarshal(decrypted, &wrapper); err == nil && len(wrapper.Accounts) > 0 {
+		configs = wrapper.Accounts
+	} else {
+		if err := json.Unmarshal(decrypted, &configs); err != nil {
+			return nil, fmt.Errorf("failed to parse decrypted JSON: %w", err)
+		}
+	}
+
+	var accounts []*MailAccount
+	for _, cfg := range configs {
+		acc, err := NewMailAccount(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("invalid account config for %s: %w", cfg.Email, err)
+		}
+		accounts = append(accounts, acc)
+	}
+
+	return accounts, nil
+}
+
+// SaveAccountsEncrypted saves accounts to a file encrypted with a password
+func SaveAccountsEncrypted(filePath string, accounts []*MailAccount, password string) error {
+	configs := make([]AccountConfig, len(accounts))
+	for i, acc := range accounts {
+		configs[i] = AccountConfig{
+			Email:    acc.Email,
+			Password: acc.Password,
+			IMAPHost: acc.IMAPHost,
+			SMTPHost: acc.SMTPHost,
+			Folder:   acc.Folder,
+		}
+	}
+
+	data, err := json.MarshalIndent(configs, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	encrypted, err := crypto.Encrypt(password, data)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(filePath, encrypted, 0600)
+}
+
+// SerializeAccounts serializes accounts to JSON bytes (for portable archives)
+func SerializeAccounts(accounts []*MailAccount) ([]byte, error) {
+	configs := make([]AccountConfig, len(accounts))
+	for i, acc := range accounts {
+		configs[i] = AccountConfig{
+			Email:    acc.Email,
+			Password: acc.Password,
+			IMAPHost: acc.IMAPHost,
+			SMTPHost: acc.SMTPHost,
+			Folder:   acc.Folder,
+		}
+	}
+	return json.MarshalIndent(configs, "", "  ")
+}
+
+// IsEncrypted checks if the file at filePath is likely encrypted
+func IsEncrypted(filePath string) (bool, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return false, err
+	}
+	if len(data) < 1 {
+		return false, nil
+	}
+	// JSON should start with { or [
+	return data[0] != '{' && data[0] != '[', nil
 }
 
 // NewMailAccount creates a MailAccount from AccountConfig

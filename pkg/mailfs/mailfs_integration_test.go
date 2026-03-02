@@ -2,7 +2,6 @@ package mailfs_test
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -174,10 +173,9 @@ func TestJuiceFSBigFileWrite(t *testing.T) {
 
 	// 4. Initialize Chunk Store
 	chunkConf := chunk.Config{
-		BlockSize:   10 * 1024 * 1024,
-		Compress:    "none",
-		MaxUpload:   1,
-		MaxDownload: 1,
+		BlockSize: 10 * 1024 * 1024,
+		Compress:  "none",
+		MaxUpload: 1,
 	}
 
 	// Using the constructor you provided in the prompt
@@ -247,7 +245,7 @@ func TestJuiceFSBigFileWrite(t *testing.T) {
 
 	// Check MailFS Internal State
 	// Using generic context for object
-	objs, _, _, _ := blobStore.List(context.Background(), "", "", "", "", 100, false)
+	objs, _, _, _ := blobStore.List("", "", "", "", 100, false)
 	t.Logf("Found %d chunks in MailFS:", len(objs))
 	for _, o := range objs {
 		t.Logf(" - Key: %s | Size: %d", o.Key(), o.Size())
@@ -303,9 +301,8 @@ func TestJuiceFSForceIMAPRead(t *testing.T) {
 	_ = m.Init(&meta.Format{Name: "testfs", UUID: "test-uuid", Storage: "mailfs", BlockSize: 4096}, true)
 
 	chunkConf := chunk.Config{
-		BlockSize:   10 * 1024 * 1024,
-		MaxUpload:   1,
-		MaxDownload: 1,
+		BlockSize: 10 * 1024 * 1024,
+		MaxUpload: 1,
 	}
 	chunkStore := chunk.NewCachedStore(blobStore, chunkConf, nil)
 	jfs := vfs.NewVFS(&vfs.Config{Chunk: &chunkConf, Meta: &metaConf}, m, chunkStore, nil, nil)

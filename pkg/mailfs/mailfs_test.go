@@ -18,7 +18,6 @@ package mailfs
 
 import (
 	"bytes"
-	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -284,13 +283,12 @@ func TestMailFSBasic(t *testing.T) {
 	defer mfs.Close()
 	t.Logf("✅ MailFS initialized successfully")
 
-	ctx := context.Background()
 	testKey := "test-key-basic-" + fmt.Sprintf("%d", time.Now().Unix()%10000)
 	testData := []byte("Hello, MailFS! Content at " + time.Now().Format(time.RFC3339))
 
 	// 1. Test Put
 	t.Logf("[STEP 1] Performing Put for key: %s (%d bytes)", testKey, len(testData))
-	err = mfs.Put(ctx, testKey, bytes.NewReader(testData))
+	err = mfs.Put(testKey, bytes.NewReader(testData))
 	if err != nil {
 		if !isRealConfig {
 			t.Logf("⚠️ Put failed as expected with dummy config (No SMTP server). Injecting data to test remaining logic...")
@@ -315,7 +313,7 @@ func TestMailFSBasic(t *testing.T) {
 
 	// 2. Test Head
 	t.Logf("[STEP 2] Performing Head for key: %s", testKey)
-	info, err := mfs.Head(ctx, testKey)
+	info, err := mfs.Head(testKey)
 	if err != nil {
 		t.Fatalf("❌ Head failed: %v", err)
 	}
@@ -334,7 +332,7 @@ func TestMailFSBasic(t *testing.T) {
 		t.Logf("   (Cleared local cache to force IMAP download)")
 	}
 
-	reader, err := mfs.Get(ctx, testKey, 0, -1)
+	reader, err := mfs.Get(testKey, 0, -1)
 	if err != nil {
 		t.Fatalf("❌ Get failed: %v", err)
 	}
@@ -355,11 +353,11 @@ func TestMailFSBasic(t *testing.T) {
 
 	// 4. Test List
 	t.Logf("[STEP 4] Performing List with prefix ''")
-	objs, hasMore, nextMarker, err := mfs.List(ctx, "", "", "", "", 100, false)
+	objs, _, _, err := mfs.List("", "", "", "", 1000, false)
 	if err != nil {
 		t.Fatalf("❌ List failed: %v", err)
 	}
-	t.Logf("✅ List returned %d objects (hasMore: %v, nextMarker: %s)", len(objs), hasMore, nextMarker)
+	t.Logf("✅ List returned %d objects (hasMore: %v, nextMarker: %s)", len(objs), false, "")
 
 	found := false
 	for _, o := range objs {
@@ -377,14 +375,14 @@ func TestMailFSBasic(t *testing.T) {
 	// 5. Test Delete
 	time.Sleep(2 * time.Second) // Wait a bit to ensure email delivery is settled
 	t.Logf("[STEP 5] Performing Delete for key: %s", testKey)
-	err = mfs.Delete(ctx, testKey)
+	err = mfs.Delete(testKey)
 	if err != nil {
 		t.Fatalf("❌ Delete failed: %v", err)
 	}
 	t.Logf("✅ Delete command executed successfully.")
 
 	// Verify deletion
-	_, err = mfs.Head(ctx, testKey)
+	_, err = mfs.Head(testKey)
 	if err == nil || !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("❌ Head should have failed with 'not exist' after Delete, but got: %v", err)
 	} else {
@@ -429,7 +427,7 @@ func TestBlobDataStorage(t *testing.T) {
 	mfs.Unlock()
 
 	// Retrieve from cache
-	r, err := mfs.Get(context.Background(), testKey, 0, -1)
+	r, err := mfs.Get(testKey, 0, -1)
 	if err != nil {
 		t.Fatalf("Failed to get from cache: %v", err)
 	}
@@ -512,7 +510,6 @@ func TestOffsetAndLimit(t *testing.T) {
 	}
 	defer mfs.Close()
 
-	ctx := context.Background()
 	testKey := "offset-limit-test"
 	testData := []byte("0123456789abcdefghij") // 20 bytes
 
@@ -527,7 +524,7 @@ func TestOffsetAndLimit(t *testing.T) {
 	mfs.Unlock()
 
 	// Test Offset
-	reader, err := mfs.Get(ctx, testKey, 5, -1)
+	reader, err := mfs.Get(testKey, 5, -1)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
@@ -537,7 +534,7 @@ func TestOffsetAndLimit(t *testing.T) {
 	}
 
 	// Test Offset + Limit
-	reader, err = mfs.Get(ctx, testKey, 5, 5)
+	reader, err = mfs.Get(testKey, 5, 5)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
