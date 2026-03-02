@@ -610,3 +610,79 @@ func (c *MBoxClient) lookupPath(path string) (vfs.Ino, error) {
 func (c *MBoxClient) GlobalWipe() error {
 	return c.blob.WipeAllCloudData()
 }
+
+type SliceInfo struct {
+	meta.Slice
+	PrimaryAccount int
+	ReplicaAccount int
+	PrimaryMsgID   string
+	ReplicaMsgID   string
+	PrimaryEmail   string
+	ReplicaEmail   string
+}
+
+type ChunkInfo struct {
+	Index  uint32
+	Slices []SliceInfo
+}
+
+type MBoxFileInfo struct {
+	Path   string
+	Ino    vfs.Ino
+	Size   uint64
+	Chunks []ChunkInfo
+}
+
+func (c *MBoxClient) GetFileInfo(path string) (*MBoxFileInfo, error) {
+	ino, err := c.lookupPath(path)
+	if err != nil {
+		return nil, err
+	}
+
+	attr, errno := c.vfs.GetAttr(c.auth, ino, 0)
+	if errno != 0 {
+		return nil, fmt.Errorf("getattr failed: %v", errno)
+	}
+
+	info := &MBoxFileInfo{
+		Path: path,
+		Ino:  ino,
+		Size: attr.Attr.Length,
+	}
+
+	if attr.Attr.Typ != meta.TypeFile {
+		return info, nil
+	}
+
+	for i := uint32(0); ; i++ {
+		var slices []meta.Slice
+		errno := c.meta.Read(c.auth, ino, i, &slices)
+		if errno != 0 || (len(slices) == 0 && uint64(i)*64*1024*1024 >= info.Size) {
+			break
+		}
+		if len(slices) == 0 {
+			continue
+		}
+
+		cinfo := ChunkInfo{Index: i}
+		for _, s := range slices {
+			sinfo := SliceInfo{Slice: s}
+			key, err := c.blob.FindKeyByChunkID(s.Id)
+			if err == nil {
+				p, r, pm, rm, err := c.blob.GetBlobInfo(key)
+				if err == nil {
+					sinfo.PrimaryAccount = p
+					sinfo.ReplicaAccount = r
+					sinfo.PrimaryMsgID = pm
+					sinfo.ReplicaMsgID = rm
+					sinfo.PrimaryEmail = c.blob.GetAccountEmail(p)
+					sinfo.ReplicaEmail = c.blob.GetAccountEmail(r)
+				}
+			}
+			cinfo.Slices = append(cinfo.Slices, sinfo)
+		}
+		info.Chunks = append(info.Chunks, cinfo)
+	}
+
+	return info, nil
+}

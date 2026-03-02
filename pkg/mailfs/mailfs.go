@@ -743,6 +743,53 @@ func (m *MailFS) Get(key string, off, limit int64, getters ...object.AttrGetter)
 	return m.readRange(data, off, limit), nil
 }
 
+func (m *MailFS) GetBlobInfo(key string) (int, int, string, string, error) {
+	m.RLock()
+	if blob, ok := m.blobCache[key]; ok {
+		m.RUnlock()
+		return blob.account, blob.replicaAccount, blob.msgID, blob.replicaMsgID, nil
+	}
+	m.RUnlock()
+
+	var primaryIdx int
+	var replicaIdx sql.NullInt64
+	var primaryMsgID string
+	var replicaMsgID sql.NullString
+
+	row := m.db.QueryRow(
+		`SELECT account, replica_account, msg_id, replica_msg_id 
+		 FROM blobs 
+		 WHERE key = ?`, key)
+
+	err := row.Scan(&primaryIdx, &replicaIdx, &primaryMsgID, &replicaMsgID)
+	if err == sql.ErrNoRows {
+		return 0, -1, "", "", os.ErrNotExist
+	}
+	if err != nil {
+		return 0, -1, "", "", err
+	}
+
+	repIdx := -1
+	if replicaIdx.Valid {
+		repIdx = int(replicaIdx.Int64)
+	}
+	return primaryIdx, repIdx, primaryMsgID, replicaMsgID.String, nil
+}
+
+func (m *MailFS) FindKeyByChunkID(cid uint64) (string, error) {
+	prefix := fmt.Sprintf("chunks/%d_", cid)
+	var key string
+	err := m.db.QueryRow("SELECT key FROM blobs WHERE key LIKE ? LIMIT 1", prefix+"%").Scan(&key)
+	return key, err
+}
+
+func (m *MailFS) GetAccountEmail(idx int) string {
+	if idx >= 0 && idx < len(m.accounts) {
+		return m.accounts[idx].Email
+	}
+	return "unknown"
+}
+
 func (m *MailFS) readRange(data []byte, off, limit int64) io.ReadCloser {
 	if off > int64(len(data)) {
 		off = int64(len(data))

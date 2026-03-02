@@ -242,6 +242,13 @@ func main() {
 				Flags:  commonFlags,
 				Action: doWipe,
 			},
+			{
+				Name:   "info",
+				Usage:  "Show chunk-slice-blob details for a file (debug usage)",
+				Hidden: true,
+				Flags:  commonFlags,
+				Action: doInfo,
+			},
 		},
 	}
 
@@ -1076,4 +1083,72 @@ func getTargetID(target string) string {
 	// Use name, size and modtime to create a reasonably unique ID for this archive session
 	fmt.Fprintf(h, "%s%d%d", filepath.Base(target), info.Size(), info.ModTime().UnixNano())
 	return fmt.Sprintf("%x", h.Sum(nil))[:8]
+}
+
+func doInfo(c *cli.Context) error {
+if c.NArg() < 2 {
+return fmt.Errorf("usage: mbox info <mbox_file> <path_inside>")
+}
+stickFile := c.Args().Get(0)
+vPath := c.Args().Get(1)
+
+archivePwd, err := getArchivePassword(c, false, "")
+if err != nil {
+return err
+}
+
+// 1. Unpack to temp
+tmpDir, err := os.MkdirTemp("", "mbox-info-*")
+if err != nil {
+return err
+}
+defer os.RemoveAll(tmpDir)
+
+if err := mbox.Unpack(archivePwd, stickFile, tmpDir); err != nil {
+return fmt.Errorf("unpack failed: %w", err)
+}
+
+// 2. Load Config from Stick
+innerCfgPath := filepath.Join(tmpDir, "config.json")
+parsed, err := config.LoadAccountsFromJSON(innerCfgPath)
+if err != nil {
+return fmt.Errorf("failed to load inner config: %w", err)
+}
+
+// 3. Init Client with DB from Stick
+dbPath := filepath.Join(tmpDir, "mailfs.db")
+client, err := mbox.NewMBoxClient(dbPath, parsed, true, getParallel(c), getTimeout(c))
+if err != nil {
+return err
+}
+defer client.Close()
+if err := client.Init(false); err != nil {
+return fmt.Errorf("failed to load fs: %w", err)
+}
+
+// 4. Get Info
+info, err := client.GetFileInfo(vPath)
+if err != nil {
+return err
+}
+
+fmt.Printf("File: %s\n", info.Path)
+fmt.Printf("Inode: %d\n", info.Ino)
+fmt.Printf("Size: %d bytes\n", info.Size)
+fmt.Printf("Chunks: %d\n", len(info.Chunks))
+
+for _, chunk := range info.Chunks {
+fmt.Printf("  Chunk %d:\n", chunk.Index)
+for _, slice := range chunk.Slices {
+fmt.Printf("    Slice ID %d (Size: %d, Off: %d, Len: %d):\n", slice.Id, slice.Size, slice.Off, slice.Len)
+if slice.PrimaryMsgID != "" {
+fmt.Printf("      Primary: %s (Acc %d: %s)\n", slice.PrimaryMsgID, slice.PrimaryAccount, slice.PrimaryEmail)
+}
+if slice.ReplicaMsgID != "" {
+fmt.Printf("      Replica: %s (Acc %d: %s)\n", slice.ReplicaMsgID, slice.ReplicaAccount, slice.ReplicaEmail)
+}
+}
+}
+
+return nil
 }
