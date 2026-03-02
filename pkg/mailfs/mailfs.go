@@ -753,6 +753,14 @@ func (m *MailFS) storeWithRetry(initialIdx int, otherIdx int, key string, data [
 		return initialIdx, mid, nil
 	}
 
+	// 0.1 Check the "other" (replica) account too, just in case
+	if otherIdx != initialIdx {
+		if mid, err := m.findBlobInCloud(otherIdx, key); err == nil && mid != "" {
+			logger.Infof("[MailFS] Found existing blob %s in replica account %d, skipping upload", key, otherIdx)
+			return otherIdx, mid, nil
+		}
+	}
+
 	// 1. Try initialIdx
 	msgID, err := func() (string, error) {
 		unlock := m.lockAccounts(initialIdx)
@@ -798,6 +806,12 @@ func (m *MailFS) storeWithRetry(initialIdx int, otherIdx int, key string, data [
 
 	var lastErr error = err
 	for _, altIdx := range alternatives {
+		// Check cloud for alternative FIRST
+		if mid, err := m.findBlobInCloud(altIdx, key); err == nil && mid != "" {
+			logger.Infof("[MailFS] Found existing blob %s in alternative account %d, skipping re-upload", key, altIdx)
+			return altIdx, mid, nil
+		}
+
 		mid, err := func() (string, error) {
 			unlock := m.lockAccounts(altIdx)
 			defer unlock()
@@ -829,18 +843,37 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 		return err
 	}
 
-	// 0. Check local database first (handles retries within the same run)
-	var existingMsgID string
-	err = m.db.QueryRow("SELECT msg_id FROM blobs WHERE key = ?", key).Scan(&existingMsgID)
-	if err == nil && existingMsgID != "" {
-		logger.Infof("[MailFS] Blob %s already exists in database, skipping upload", key)
+	// 0. Check local database first (handles retries and partial uploads)
+	var dbAcc int
+	var dbRepAcc sql.NullInt64
+	var dbMsgID, dbRepMsgID sql.NullString
+	row := m.db.QueryRow("SELECT account, replica_account, msg_id, replica_msg_id FROM blobs WHERE key = ?", key)
+	err = row.Scan(&dbAcc, &dbRepAcc, &dbMsgID, &dbRepMsgID)
+
+	primaryIdx, replicaIdx := m.getReplicaAccounts(key)
+	var msgID, replicaMsgID string
+	needPrimary := true
+	needReplica := m.config.ReplicationFactor > 1
+
+	if err == nil {
+		if dbMsgID.Valid && dbMsgID.String != "" {
+			needPrimary = false
+			primaryIdx = dbAcc
+			msgID = dbMsgID.String
+		}
+		if dbRepMsgID.Valid && dbRepMsgID.String != "" {
+			needReplica = false
+			replicaIdx = int(dbRepAcc.Int64)
+			replicaMsgID = dbRepMsgID.String
+		}
+	}
+
+	if !needPrimary && !needReplica {
+		logger.Debugf("[MailFS] Blob %s already exists in database with all required replicas, skipping", key)
 		return nil
 	}
 
-	primaryIdx, replicaIdx := m.getReplicaAccounts(key)
-
 	// 1 & 2. Upload to Email (Primary and Replica in Parallel)
-	var msgID, replicaMsgID string
 	var pErr, rErr error
 	var uploadWg sync.WaitGroup
 	finalPrimaryIdx, finalReplicaIdx := primaryIdx, replicaIdx
@@ -848,20 +881,34 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 	uploadWg.Add(1)
 	go func() {
 		defer uploadWg.Done()
+		if !needPrimary {
+			return
+		}
 		idx, mid, err := m.storeWithRetry(primaryIdx, replicaIdx, key, data)
 		finalPrimaryIdx = idx
 		msgID = mid
 		pErr = err
+		if err == nil {
+			// Early persistence of primary
+			_ = m.updateBlobMetadataInternal(key, int64(len(data)), idx, mid, true)
+		}
 	}()
 
-	if replicaIdx != primaryIdx {
+	if replicaIdx != primaryIdx || (needReplica && !needPrimary) {
 		uploadWg.Add(1)
 		go func() {
 			defer uploadWg.Done()
+			if !needReplica {
+				return
+			}
 			idx, mid, err := m.storeWithRetry(replicaIdx, primaryIdx, key, data)
 			finalReplicaIdx = idx
 			replicaMsgID = mid
 			rErr = err
+			if err == nil {
+				// Early persistence of replica
+				_ = m.updateBlobMetadataInternal(key, int64(len(data)), idx, mid, false)
+			}
 		}()
 	}
 
@@ -2333,6 +2380,36 @@ func (m *MailFS) WipeAllCloudData() error {
 
 	logger.Infof("Global cloud wipe complete.")
 	return nil
+}
+
+func (m *MailFS) updateBlobMetadataInternal(key string, size int64, accountIdx int, msgID string, isPrimary bool) error {
+	m.Lock()
+	defer m.Unlock()
+
+	now := time.Now().UnixNano()
+	if isPrimary {
+		_, err := m.db.Exec(`
+			INSERT INTO blobs (key, size, mtime, account, msg_id, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(key) DO UPDATE SET
+				account=excluded.account,
+				msg_id=excluded.msg_id,
+				size=excluded.size,
+				mtime=excluded.mtime
+		`, key, size, now, accountIdx, msgID, now)
+		return err
+	} else {
+		_, err := m.db.Exec(`
+			INSERT INTO blobs (key, size, mtime, replica_account, replica_msg_id, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(key) DO UPDATE SET
+				replica_account=excluded.replica_account,
+				replica_msg_id=excluded.replica_msg_id,
+				size=excluded.size,
+				mtime=excluded.mtime
+		`, key, size, now, accountIdx, msgID, now)
+		return err
+	}
 }
 
 // LoginAuth implements the LOGIN authentication mechanism (Outlook compatibility).
