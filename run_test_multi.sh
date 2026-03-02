@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Default config (relative to repo root)
-TEST_CONFIG_PATH=./pkg/object/mailfs_conf_multi1.json
+TEST_CONFIG_PATH=./pkg/object/mailfs_conf_multi.json
 
 export TEST_CONFIG="$TEST_CONFIG_PATH"
 

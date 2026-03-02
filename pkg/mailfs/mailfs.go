@@ -178,6 +178,11 @@ type safeIMAPClient struct {
 	c *client.Client
 }
 
+type safeSMTPClient struct {
+	sync.Mutex
+	c *smtp.Client
+}
+
 type MailFS struct {
 	sync.RWMutex
 	DefaultObjectStorage // Embeds the interface implementation
@@ -186,6 +191,7 @@ type MailFS struct {
 	db          *sql.DB
 	accounts    []*config.MailAccount
 	imapClients []*safeIMAPClient
+	smtpClients []*safeSMTPClient
 	blobCache   map[string]*mailBlob // in-memory hot cache
 }
 
@@ -217,6 +223,7 @@ func NewMailFS(cfg config.MailFSConfig) (*MailFS, error) {
 		db:          db,
 		accounts:    cfg.Accounts,
 		imapClients: make([]*safeIMAPClient, len(cfg.Accounts)),
+		smtpClients: make([]*safeSMTPClient, len(cfg.Accounts)),
 		blobCache:   make(map[string]*mailBlob),
 	}
 
@@ -596,25 +603,36 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 
 	return nil
 }
-
-func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, error) {
-	if accountIdx >= len(m.accounts) {
-		return "", fmt.Errorf("invalid account index %d", accountIdx)
+func (m *MailFS) getSMTPClient(accountIdx int) (*safeSMTPClient, error) {
+	if accountIdx >= len(m.smtpClients) {
+		return nil, fmt.Errorf("invalid account index %d", accountIdx)
 	}
+
 	acc := m.accounts[accountIdx]
-	emailErr := func(msg string, err error) error {
-		return fmt.Errorf("[Acc: %s] %s: %w", acc.Email, msg, err)
+	sc := m.smtpClients[accountIdx]
+	if sc == nil {
+		sc = &safeSMTPClient{}
+		m.smtpClients[accountIdx] = sc
 	}
 
+	sc.Lock()
+	// Check if already connected and alive
+	if sc.c != nil {
+		if err := sc.c.Noop(); err == nil {
+			return sc, nil
+		}
+		// Connection lost, try to close gently
+		_ = sc.c.Quit()
+		sc.c = nil
+	}
+
+	// Connect and login
 	host, port, err := net.SplitHostPort(acc.SMTPHost)
 	if err != nil {
 		host = acc.SMTPHost
-		port = "465" // Default to SSL port
+		port = "465"
 	}
 	addr := net.JoinHostPort(host, port)
-
-	logger.Infof("[SMTP] Attempting connection to %s for blob %s", addr, key)
-
 	tlsConfig := &tls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: os.Getenv("MAILFS_SKIP_TLS_VERIFY") == "1",
@@ -631,56 +649,76 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 
 	var c *smtp.Client
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
-	// 1. If port is 465, use Implicit SSL
 	if port == "465" {
-		logger.Debugf("[SMTP] Using Implicit SSL for port 465")
 		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
 		if err != nil {
-			return "", emailErr("SMTP DialTLS failed", err)
+			sc.Unlock()
+			return nil, fmt.Errorf("[Acc: %s] DialTLS: %w", acc.Email, err)
 		}
 		c, err = smtp.NewClient(conn, host)
-		if err != nil {
-			conn.Close()
-			return "", emailErr("SMTP NewClient failed", err)
-		}
 	} else {
-		// 2. Use Plain connection + STARTTLS (Port 587/25)
-		logger.Debugf("[SMTP] Using STARTTLS for port %s", port)
 		conn, err := dialer.Dial("tcp", addr)
 		if err != nil {
-			return "", emailErr("SMTP Dial failed", err)
+			sc.Unlock()
+			return nil, fmt.Errorf("[Acc: %s] Dial: %w", acc.Email, err)
 		}
 		c, err = smtp.NewClient(conn, host)
-		if err != nil {
-			conn.Close()
-			return "", emailErr("SMTP NewClient failed", err)
-		}
-		if ok, _ := c.Extension("STARTTLS"); ok {
-			if err = c.StartTLS(tlsConfig); err != nil {
-				c.Close()
-				return "", emailErr("SMTP STARTTLS failed", err)
+		if err == nil {
+			if ok, _ := c.Extension("STARTTLS"); ok {
+				if err = c.StartTLS(tlsConfig); err != nil {
+					c.Close()
+					sc.Unlock()
+					return nil, fmt.Errorf("[Acc: %s] STARTTLS: %w", acc.Email, err)
+				}
 			}
 		}
 	}
-	defer c.Quit()
 
-	// 3. Authenticate
-	logger.Debugf("[SMTP] Authenticating %s...", acc.Email)
+	if err != nil {
+		sc.Unlock()
+		return nil, fmt.Errorf("[Acc: %s] NewClient: %w", acc.Email, err)
+	}
+
+	// Login
 	auth := smtp.PlainAuth("", acc.Email, acc.Password, host)
 	if err = c.Auth(auth); err != nil {
-		return "", emailErr("SMTP Auth failed", err)
+		c.Quit()
+		sc.Unlock()
+		return nil, fmt.Errorf("[Acc: %s] Auth: %w", acc.Email, err)
+	}
+
+	sc.c = c
+	return sc, nil
+}
+
+func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, error) {
+	sc, err := m.getSMTPClient(accountIdx)
+	if err != nil {
+		return "", err
+	}
+	defer sc.Unlock()
+
+	c := sc.c
+	acc := m.accounts[accountIdx]
+	emailErr := func(msg string, err error) error {
+		// If error occurs, invalidate the connection so next attempt reconnects
+		_ = c.Quit()
+		sc.c = nil
+		return fmt.Errorf("[Acc: %s] %s: %w", acc.Email, msg, err)
 	}
 
 	// 4. Construct Content
 	boundary := fmt.Sprintf("JUICEFS_BOUNDARY_%d", time.Now().UnixNano())
 	subject := fmt.Sprintf("JuiceFS Blob :%s", key)
-	// Generate a unique Message-ID for reliable searching
-	msgID := fmt.Sprintf("<juicefs-%s-%d@mailfs.local>", key, time.Now().UnixNano())
+	// Generate a realistic Message-ID using the account domain
+	domain := getDomain(acc.Email)
+	msgID := fmt.Sprintf("<juicefs-%s-%d@%s>", key, time.Now().UnixNano(), domain)
 	encodedBlob := base64.StdEncoding.EncodeToString(data)
 
 	body := new(bytes.Buffer)
 	fmt.Fprintf(body, "From: %s\r\n", acc.Email)
 	fmt.Fprintf(body, "To: %s\r\n", acc.Email)
+	fmt.Fprintf(body, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
 	fmt.Fprintf(body, "Subject: %s\r\n", subject)
 	fmt.Fprintf(body, "Message-ID: %s\r\n", msgID)
 	fmt.Fprintf(body, "X-JuiceFS-Key: %s\r\n", key)
@@ -695,8 +733,8 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 	body.WriteString("Content-Type: application/octet-stream\r\n")
 	body.WriteString("Content-Transfer-Encoding: base64\r\n")
 	fmt.Fprintf(body, "Content-Disposition: attachment; filename=\"%s.bin\"\r\n\r\n", key)
-	body.WriteString(encodedBlob)
-	body.WriteString("\r\n--" + boundary + "--\r\n")
+	body.WriteString(wrapBase64(encodedBlob))
+	body.WriteString("--" + boundary + "--\r\n")
 
 	// 5. Send Data
 	logger.Debugf("[SMTP] Sending MAIL FROM...")
@@ -715,9 +753,18 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 		return "", emailErr("DATA command failed", err)
 	}
 
-	if _, err = w.Write(body.Bytes()); err != nil {
-		w.Close()
-		return "", emailErr("writing body failed", err)
+	// Write body in chunks to avoid blocking and handle large data better
+	const chunkWriteSize = 64 * 1024
+	bodyBytes := body.Bytes()
+	for i := 0; i < len(bodyBytes); i += chunkWriteSize {
+		end := i + chunkWriteSize
+		if end > len(bodyBytes) {
+			end = len(bodyBytes)
+		}
+		if _, err = w.Write(bodyBytes[i:end]); err != nil {
+			w.Close()
+			return "", emailErr("writing body failed", err)
+		}
 	}
 
 	if err = w.Close(); err != nil {
@@ -728,6 +775,27 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 	return msgID, nil
 }
 
+func getDomain(email string) string {
+	parts := strings.Split(email, "@")
+	if len(parts) > 1 {
+		return parts[1]
+	}
+	return "localhost"
+}
+
+func wrapBase64(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i += 76 {
+		end := i + 76
+		if end > len(s) {
+			end = len(s)
+		}
+		b.WriteString(s[i:end])
+		b.WriteString("\r\n")
+	}
+	return b.String()
+}
+
 // UploadMBox uploads an encrypted .mbox file to the specified account.
 func (m *MailFS) UploadMBox(filename string, data []byte) error {
 	subject := fmt.Sprintf("MBox Config: %s", filename)
@@ -735,52 +803,15 @@ func (m *MailFS) UploadMBox(filename string, data []byte) error {
 }
 
 func (m *MailFS) storeGenericFile(subject string, filename string, data []byte) error {
-	// For simplicity, we use account 0 for config storage
 	accountIdx := 0
-	acc := m.accounts[accountIdx]
-
-	host, port, err := net.SplitHostPort(acc.SMTPHost)
+	sc, err := m.getSMTPClient(accountIdx)
 	if err != nil {
-		host = acc.SMTPHost
-		port = "465"
-	}
-	addr := net.JoinHostPort(host, port)
-
-	tlsConfig := &tls.Config{
-		ServerName:         host,
-		InsecureSkipVerify: os.Getenv("MAILFS_SKIP_TLS_VERIFY") == "1",
-		MinVersion:         tls.VersionTLS10,
-	}
-
-	var c *smtp.Client
-	if port == "465" {
-		conn, err := tls.Dial("tcp", addr, tlsConfig)
-		if err != nil {
-			return err
-		}
-		c, err = smtp.NewClient(conn, host)
-		if err != nil {
-			conn.Close()
-			return err
-		}
-	} else {
-		c, err = smtp.Dial(addr)
-		if err != nil {
-			return err
-		}
-		if ok, _ := c.Extension("STARTTLS"); ok {
-			if err = c.StartTLS(tlsConfig); err != nil {
-				c.Close()
-				return err
-			}
-		}
-	}
-	defer c.Quit()
-
-	auth := smtp.PlainAuth("", acc.Email, acc.Password, host)
-	if err = c.Auth(auth); err != nil {
 		return err
 	}
+	defer sc.Unlock()
+
+	c := sc.c
+	acc := m.accounts[accountIdx]
 
 	boundary := fmt.Sprintf("MBOX_BOUNDARY_%d", time.Now().UnixNano())
 	encodedData := base64.StdEncoding.EncodeToString(data)
@@ -788,7 +819,9 @@ func (m *MailFS) storeGenericFile(subject string, filename string, data []byte) 
 	body := new(bytes.Buffer)
 	fmt.Fprintf(body, "From: %s\r\n", acc.Email)
 	fmt.Fprintf(body, "To: %s\r\n", acc.Email)
+	fmt.Fprintf(body, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
 	fmt.Fprintf(body, "Subject: %s\r\n", subject)
+	fmt.Fprintf(body, "Message-ID: <mbox-cfg-%d@%s>\r\n", time.Now().UnixNano(), getDomain(acc.Email))
 	fmt.Fprintf(body, "MIME-Version: 1.0\r\n")
 	fmt.Fprintf(body, "Content-Type: multipart/mixed; boundary=%s\r\n\r\n", boundary)
 
@@ -796,21 +829,44 @@ func (m *MailFS) storeGenericFile(subject string, filename string, data []byte) 
 	body.WriteString("Content-Type: application/octet-stream\r\n")
 	body.WriteString("Content-Transfer-Encoding: base64\r\n")
 	fmt.Fprintf(body, "Content-Disposition: attachment; filename=\"%s\"\r\n\r\n", filename)
-	body.WriteString(encodedData)
-	body.WriteString("\r\n--" + boundary + "--\r\n")
+	body.WriteString(wrapBase64(encodedData))
+	body.WriteString("--" + boundary + "--\r\n")
+
+	emailErr := func(msg string, err error) error {
+		_ = c.Quit()
+		sc.c = nil
+		return fmt.Errorf("[Acc: %s] %s: %w", acc.Email, msg, err)
+	}
 
 	if err = c.Mail(acc.Email); err != nil {
-		return err
+		return emailErr("MAIL FROM failed", err)
 	}
 	if err = c.Rcpt(acc.Email); err != nil {
-		return err
+		return emailErr("RCPT TO failed", err)
 	}
 	w, err := c.Data()
 	if err != nil {
-		return err
+		return emailErr("DATA command failed", err)
 	}
-	_, _ = w.Write(body.Bytes())
-	return w.Close()
+
+	// Write body in chunks to avoid blocking and handle large data better
+	const chunkWriteSize = 64 * 1024
+	bodyBytes := body.Bytes()
+	for i := 0; i < len(bodyBytes); i += chunkWriteSize {
+		end := i + chunkWriteSize
+		if end > len(bodyBytes) {
+			end = len(bodyBytes)
+		}
+		if _, err = w.Write(bodyBytes[i:end]); err != nil {
+			w.Close()
+			return emailErr("writing body failed", err)
+		}
+	}
+
+	if err = w.Close(); err != nil {
+		return emailErr("closing data writer failed", err)
+	}
+	return nil
 }
 
 // ListMBoxes lists all .mbox files matching the pattern in the specified account.
@@ -963,7 +1019,13 @@ func (m *MailFS) DownloadMBox(filename string) ([]byte, error) {
 }
 
 func (m *MailFS) fetchFromEmail(accountIdx int, msgID string, key string) ([]byte, error) {
-	logger.Infof("[MailFS] fetchFromEmail: key=%s, msgID=%s, account=%d", key, msgID, accountIdx)
+	var email string
+	if accountIdx >= 0 && accountIdx < len(m.accounts) && m.accounts[accountIdx] != nil {
+		email = m.accounts[accountIdx].Email
+	} else {
+		email = "invalid-account"
+	}
+	logger.Infof("[MailFS] fetchFromEmail: key=%s, msgID=%s, account=%d, %s", key, msgID, accountIdx, email)
 	if accountIdx >= len(m.imapClients) || m.imapClients[accountIdx] == nil {
 		return nil, errors.New("IMAP client not initialized")
 	}
@@ -1233,7 +1295,7 @@ func (m *MailFS) findMsgUIDClientSide0(c *client.Client, key string) (uint32, er
 		// Check the Subject string.
 		// Since you save blobs as "JuiceFS Blob :<key>", checking for the key here is safe.
 		// strings.Contains is fast and avoids all server-side tokenization issues.
-		logger.Infof("Checking message SeqNum %d with msg: %v", msg.SeqNum, msg)
+		// logger.Infof("Checking message SeqNum %d with msg: %v", msg.SeqNum, msg)
 		if strings.Contains(msg.Envelope.Subject, key) {
 			// Found it! We update foundSeqNum.
 			// We keep looping to find the *highest* SeqNum (most recent) if duplicates exist.
@@ -1305,7 +1367,7 @@ func (m *MailFS) findMsgUIDClientSide(c *client.Client, key string) (uint32, err
 		if r == nil {
 			continue
 		}
-		logger.Infof("Checking message SeqNum %d with msg: %v", msg.SeqNum, msg)
+		// logger.Infof("Checking message SeqNum %d with msg: %v", msg.SeqNum, msg)
 
 		// Read the raw bytes (e.g., "Subject: JuiceFS Blob :my-key\r\n")
 		headerBytes, _ := io.ReadAll(r)
@@ -1593,6 +1655,16 @@ func (m *MailFS) Close() error {
 	for _, sc := range m.imapClients {
 		if sc != nil && sc.c != nil {
 			sc.c.Logout()
+		}
+	}
+	for _, sc := range m.smtpClients {
+		if sc != nil {
+			sc.Lock()
+			if sc.c != nil {
+				sc.c.Quit()
+				sc.c = nil
+			}
+			sc.Unlock()
 		}
 	}
 	if m.db != nil {
