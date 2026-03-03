@@ -9,6 +9,8 @@ jobs:
   release:
     name: Build and Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     container:
       image: goreleaser/goreleaser-cross:v1.23
     steps:
@@ -19,11 +21,6 @@ jobs:
 
       - name: Fix git safe.directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Diagnostic - List files
-        run: |
-          pwd
-          ls -R include/fuse
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6

@@ -38,7 +38,7 @@ builds:
     env:
       - CGO_ENABLED=1
       - CC=x86_64-w64-mingw32-gcc
-      - CGO_CFLAGS=-I./include/fuse
+      - CGO_CFLAGS=-I{{ .Env.GITHUB_WORKSPACE }}/include/fuse
     goos:
       - windows
     goarch:
@@ -97,4 +97,4 @@ changelog:
 release:
   github:
     owner: revv00
-    name: mailfs
+    name: mailbox
