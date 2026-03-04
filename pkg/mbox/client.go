@@ -44,8 +44,8 @@ func (c *DummyContext) WithValue(k, v interface{}) meta.Context {
 func NewContext() vfs.LogContext {
 	return &DummyContext{
 		Context: context.Background(),
-		UidVal:  uint32(os.Getuid()),
-		GidVal:  uint32(os.Getgid()),
+		UidVal:  0,
+		GidVal:  0,
 		PidVal:  uint32(os.Getpid()),
 	}
 }
@@ -306,7 +306,7 @@ func (c *MBoxClient) mkdirAll(path string) error {
 
 	name := filepath.Base(path)
 	var mode uint16 = 0755
-	_, errno := c.vfs.Mkdir(c.auth, parentIno, name, mode, mode)
+	_, errno := c.vfs.Mkdir(c.auth, parentIno, name, mode, 022)
 	if errno != 0 && errno != syscall.EEXIST {
 		return fmt.Errorf("mkdir %s failed: %v", path, errno)
 	}
