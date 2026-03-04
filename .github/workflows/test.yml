@@ -1,0 +1,44 @@
+name: Regression Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      mail1:
+        image: greenmail/standalone:2.1.0
+        ports:
+          - 3025:3025
+          - 3143:3143
+        env:
+          GREENMAIL_OPTS: "-Dgreenmail.setup.test.all -Dgreenmail.users=user1@provider1.com:password,user2@provider1.com:password"
+      
+      mail2:
+        image: greenmail/standalone:2.1.0
+        ports:
+          - 3026:3025
+          - 3144:3143
+        env:
+          GREENMAIL_OPTS: "-Dgreenmail.setup.test.all -Dgreenmail.users=user1@provider2.com:password,user2@provider2.com:password"
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+
+    - name: Install dependencies
+      run: go mod download
+
+    - name: Run CI Regression Tests
+      run: ./scripts/run-ci-tests.sh
