@@ -5,7 +5,8 @@ A portable, secure, and extremely simple CLI tool to turn your email accounts in
 ---
 
 ## 🛠 Installation
-If you have Go installed:
+- Option 1: Download from [Releases](https://github.com/revv00/mailfs/releases).
+- Option 2: If you have Go installed:
 ```bash
 go install github.com/revv00/mailfs/cmd/mbox@latest
 ```
