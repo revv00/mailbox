@@ -358,37 +358,38 @@ func (m *MailFS) connectIMAP(acc *config.MailAccount) (*client.Client, error) {
 
 	var c *client.Client
 
-	// 1. Try Dialing with Implicit TLS (Usually port 993)
+	// 1. Determine if we should use implicit TLS
+	isTLS := (port == "993" || port == "3993")
 	dialer := &net.Dialer{Timeout: 15 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
 
-	if err != nil {
-		logger.Debugf("[IMAP] TLS handshake failed for %s: %v. Trying STARTTLS on port 143...", acc.Email, err)
-
-		// 2. Fallback to Port 143 + STARTTLS
-		plainAddr := net.JoinHostPort(host, "143")
-		plainConn, pErr := net.DialTimeout("tcp", plainAddr, 15*time.Second)
-		if pErr != nil {
-			return nil, fmt.Errorf("connection failed on both 993 and 143: %w", pErr)
-		}
-
-		c, err = client.New(plainConn)
-		if err == nil {
-			err = c.StartTLS(tlsConfig)
-		}
-
+	if isTLS {
+		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
 		if err != nil {
-			if c != nil {
-				c.Close()
-			}
-			return nil, fmt.Errorf("STARTTLS failed: %w", err)
+			return nil, fmt.Errorf("TLS dial to %s failed: %w", addr, err)
 		}
-	} else {
-		// Successfully connected via DialTLS
 		c, err = client.New(conn)
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("failed to create client: %w", err)
+			return nil, fmt.Errorf("failed to create IMAP client: %w", err)
+		}
+	} else {
+		// Plain Dial + optional STARTTLS
+		conn, err := dialer.Dial("tcp", addr)
+		if err != nil {
+			return nil, fmt.Errorf("dial to %s failed: %w", addr, err)
+		}
+		c, err = client.New(conn)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create IMAP client: %w", err)
+		}
+
+		// If the server supports STARTTLS, use it
+		if ok, _ := c.SupportStartTLS(); ok {
+			if err := c.StartTLS(tlsConfig); err != nil {
+				c.Close()
+				return nil, fmt.Errorf("STARTTLS failed: %w", err)
+			}
 		}
 	}
 
@@ -1080,9 +1081,13 @@ func (m *MailFS) connectSMTP(acc *config.MailAccount) (*smtp.Client, error) {
 		},
 	}
 
-	var c *smtp.Client
+	// 1. Determine if we should use implicit TLS (SMTPS)
+	// Standard SMTPS port is 465. GreenMail SMTPS is 3465.
+	isTLS := (port == "465" || port == "3465")
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
-	if port == "465" {
+
+	var c *smtp.Client
+	if isTLS {
 		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
 		if err != nil {
 			return nil, fmt.Errorf("DialTLS: %w", err)
@@ -1093,6 +1098,7 @@ func (m *MailFS) connectSMTP(acc *config.MailAccount) (*smtp.Client, error) {
 			return nil, fmt.Errorf("NewClient: %w", err)
 		}
 	} else {
+		// Plain Dial + optional STARTTLS
 		conn, err := dialer.Dial("tcp", addr)
 		if err != nil {
 			return nil, fmt.Errorf("Dial: %w", err)
@@ -1102,6 +1108,9 @@ func (m *MailFS) connectSMTP(acc *config.MailAccount) (*smtp.Client, error) {
 			conn.Close()
 			return nil, fmt.Errorf("NewClient: %w", err)
 		}
+
+		// If the server supports STARTTLS, use it
+		// GreenMail and many modern servers support STARTTLS
 		if ok, _ := c.Extension("STARTTLS"); ok {
 			if err = c.StartTLS(tlsConfig); err != nil {
 				c.Close()

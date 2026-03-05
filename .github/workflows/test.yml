@@ -10,27 +10,27 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    services:
-      mail1:
-        image: greenmail/standalone:2.1.0
-        ports:
-          - 3025:3025
-          - 3143:3143
-        env:
-          GREENMAIL_OPTS: "-Dgreenmail.setup.test.all -Dgreenmail.users=user1@provider1.com:password,user2@provider1.com:password"
-      
-      mail2:
-        image: greenmail/standalone:2.1.0
-        ports:
-          - 3026:3025
-          - 3144:3143
-        env:
-          GREENMAIL_OPTS: "-Dgreenmail.setup.test.all -Dgreenmail.users=user1@provider2.com:password,user2@provider2.com:password"
-
     steps:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
+
+    - name: Start Mail Services
+      run: |
+        docker run -d --name mail1 -p 3025:3025 -p 3143:3143 greenmail/standalone:2.1.1 \
+          -Dgreenmail.setup.test.all \
+          -Dgreenmail.hostname=0.0.0.0 \
+          -Dgreenmail.users=user1@provider1.com:password,user2@provider1.com:password
+        
+        docker run -d --name mail2 -p 3026:3025 -p 3144:3143 greenmail/standalone:2.1.1 \
+          -Dgreenmail.setup.test.all \
+          -Dgreenmail.hostname=0.0.0.0 \
+          -Dgreenmail.users=user1@provider2.com:password,user2@provider2.com:password
+        
+        sleep 5
+        docker ps
+        docker logs mail1
+        docker logs mail2
 
     - name: Set up Go
       uses: actions/setup-go@v5
