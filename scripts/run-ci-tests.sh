@@ -94,21 +94,12 @@ fi
 echo -e "\n${GREEN}=== Testing Resume Logic (Simulated Failure) ===${NC}"
 cd "$REPO_ROOT"
 rm -rf ~/.mbox/state
-# No need to remove resume_test.mbox if we use test_data.mbox consistently
-
-# Patch to fail after 10MB
-perl -i -pe 's/wErr := c\.vfs\.Write/if offset >= 10 * 1024 * 1024 { panic("simulated failure") }\n\t\t\t\twErr := c\.vfs\.Write/' pkg/mbox/client.go
-go build -o mbox ./cmd/mbox
 
 echo "First attempt (should fail)"
 cd "$TEST_ROOT"
-"$MBOX_BIN" stash --remove-sent=false -p "$MBOX_ARCHIVE_PASSWORD" "$TEST_ROOT/test_data" || echo "failed as expected"
+MBOX_TEST_FAIL_AFTER=$((10 * 1024 * 1024)) "$MBOX_BIN" stash --remove-sent=false -p "$MBOX_ARCHIVE_PASSWORD" "$TEST_ROOT/test_data" || echo "failed as expected"
 
-echo "Restoring code and resuming"
-cd "$REPO_ROOT"
-git checkout pkg/mbox/client.go
-go build -o mbox ./cmd/mbox
-
+echo "Resuming upload"
 cd "$TEST_ROOT"
 "$MBOX_BIN" stash --remove-sent=false -p "$MBOX_ARCHIVE_PASSWORD" "$TEST_ROOT/test_data"
 
