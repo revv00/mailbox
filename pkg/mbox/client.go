@@ -380,6 +380,13 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 			}
 
 			if n > 0 {
+				if failAfter := os.Getenv("MBOX_TEST_FAIL_AFTER"); failAfter != "" {
+					var failOffset int64
+					fmt.Sscanf(failAfter, "%d", &failOffset)
+					if offset >= failOffset {
+						panic("simulated failure")
+					}
+				}
 				wErr := c.vfs.Write(c.auth, entry.Inode, buf[:n], uint64(offset), fh)
 				if wErr == 0 {
 					fmt.Printf("Block at offset %d (size %d) uploaded.\n", offset, n)
