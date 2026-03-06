@@ -1448,7 +1448,6 @@ func (m *MailFS) ListMBoxes(pattern string) ([]string, error) {
 		if strings.Contains(subjectLine, prefix) {
 			idx := strings.Index(subjectLine, prefix)
 			fname := strings.TrimSpace(subjectLine[idx+len(prefix):])
-			fname = strings.Fields(fname)[0]
 
 			matched, _ := filepath.Match(pattern, fname)
 			if pattern == "" || pattern == "*" || matched || fname == pattern {
