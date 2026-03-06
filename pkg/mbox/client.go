@@ -33,7 +33,7 @@ func (c *DummyContext) Gids() []uint32          { return []uint32{c.GidVal} }
 func (c *DummyContext) Pid() uint32             { return c.PidVal }
 func (c *DummyContext) Cancel()                 {}
 func (c *DummyContext) Canceled() bool          { return false }
-func (c *DummyContext) CheckPermission() bool   { return true }
+func (c *DummyContext) CheckPermission() bool   { return false }
 func (c *DummyContext) Duration() time.Duration { return 0 }
 func (c *DummyContext) WithValue(k, v interface{}) meta.Context {
 	// Return a new context wrapping the value, but we need to keep our methods.
