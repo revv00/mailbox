@@ -1,21 +1,26 @@
 package mbox
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/revv00/mailfs/pkg/config"
 	"github.com/revv00/mailfs/pkg/mailfs"
+	"github.com/vbauerster/mpb/v7"
+	"github.com/vbauerster/mpb/v7/decor"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -50,6 +55,17 @@ func NewContext() vfs.LogContext {
 	}
 }
 
+type slowRequestFilter struct {
+	io.Writer
+}
+
+func (s *slowRequestFilter) Write(p []byte) (n int, err error) {
+	if bytes.Contains(p, []byte("slow request:")) {
+		return len(p), nil
+	}
+	return s.Writer.Write(p)
+}
+
 type MBoxClient struct {
 	vfs      *vfs.VFS
 	meta     meta.Meta
@@ -57,6 +73,7 @@ type MBoxClient struct {
 	blob     *mailfs.MailFS
 	parallel int
 	sem      chan struct{}
+	progress *mpb.Progress
 }
 
 func NewMBoxClient(dbPath string, conf *config.ParsedConfig, noCache bool, parallel int, putTimeout time.Duration) (*MBoxClient, error) {
@@ -86,6 +103,12 @@ func NewMBoxClient(dbPath string, conf *config.ParsedConfig, noCache bool, paral
 	retries := int(math.Ceil(math.Sqrt(3.0*timeoutSec) - 2))
 	if retries < 10 {
 		retries = 10
+	}
+
+	// Suppress "slow request" warnings from juicefs chunk logger
+	chunkLogger := utils.GetLogger("chunk")
+	if _, ok := chunkLogger.Out.(*slowRequestFilter); !ok {
+		chunkLogger.SetOutput(&slowRequestFilter{Writer: chunkLogger.Out})
 	}
 
 	// Use standard journal mode (not WAL) for portable archives.
@@ -127,6 +150,7 @@ func NewMBoxClient(dbPath string, conf *config.ParsedConfig, noCache bool, paral
 		blob:     blob,
 		parallel: parallel,
 		sem:      make(chan struct{}, parallel),
+		progress: mpb.New(mpb.WithWidth(64)),
 	}, nil
 }
 
@@ -160,6 +184,7 @@ func (c *MBoxClient) CloseDB() error {
 }
 
 func (c *MBoxClient) Close() error {
+	c.progress.Wait()
 	err1 := c.CloseFS()
 	err2 := c.blob.Close()
 	if err1 != nil {
@@ -346,7 +371,19 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 	var errMu sync.Mutex
 	var firstErr error
 
-	fmt.Printf("Uploading %s (%d bytes) in %d blocks (parallelism: %d)...\n", localPath, size, (size+vfsWriteSize-1)/vfsWriteSize, c.parallel)
+	var bar *mpb.Bar
+	if !strings.HasPrefix(filepath.Base(localPath), ".") && size > 0 {
+		bar = c.progress.AddBar(size,
+			mpb.PrependDecorators(
+				decor.Name(filepath.Base(localPath), decor.WC{W: len(filepath.Base(localPath)) + 1, C: decor.DidentRight}),
+				decor.Counters(decor.UnitKiB, "% .2f / % .2f"),
+			),
+			mpb.AppendDecorators(
+				decor.Percentage(decor.WC{W: 5}),
+				decor.AverageSpeed(decor.UnitKiB, "% .2f", decor.WC{W: 12}),
+			),
+		)
+	}
 
 	for off := int64(0); off < size; off += vfsWriteSize {
 		wg.Add(1)
@@ -389,7 +426,9 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 				}
 				wErr := c.vfs.Write(c.auth, entry.Inode, buf[:n], uint64(offset), fh)
 				if wErr == 0 {
-					fmt.Printf("Block at offset %d (size %d) uploaded.\n", offset, n)
+					if bar != nil {
+						bar.IncrBy(n)
+					}
 				}
 				if wErr != 0 {
 					errMu.Lock()
@@ -404,6 +443,9 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 	wg.Wait()
 
 	if firstErr != nil {
+		if bar != nil {
+			bar.Abort(true)
+		}
 		c.vfs.Release(c.auth, entry.Inode, fh)
 		return firstErr
 	}
@@ -414,6 +456,9 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 
 	// Update metadata final size
 	if errno := c.vfs.Truncate(c.auth, entry.Inode, size, 0, entry.Attr); errno != 0 {
+		if bar != nil {
+			bar.Abort(true)
+		}
 		return fmt.Errorf("truncate %s failed: %v", vPath, errno)
 	}
 
@@ -530,6 +575,20 @@ func (c *MBoxClient) exportFile(ino vfs.Ino, localPath string, size uint64) erro
 	var errMu sync.Mutex
 	var firstErr error
 
+	var bar *mpb.Bar
+	if !strings.HasPrefix(filepath.Base(localPath), ".") && size > 0 {
+		bar = c.progress.AddBar(int64(size),
+			mpb.PrependDecorators(
+				decor.Name(filepath.Base(localPath), decor.WC{W: len(filepath.Base(localPath)) + 1, C: decor.DidentRight}),
+				decor.Counters(decor.UnitKiB, "% .2f / % .2f"),
+			),
+			mpb.AppendDecorators(
+				decor.Percentage(decor.WC{W: 5}),
+				decor.AverageSpeed(decor.UnitKiB, "% .2f", decor.WC{W: 12}),
+			),
+		)
+	}
+
 	for off := uint64(0); off < size; off += uint64(vfsWriteSize) {
 		wg.Add(1)
 		go func(offset uint64) {
@@ -565,6 +624,11 @@ func (c *MBoxClient) exportFile(ino vfs.Ino, localPath string, size uint64) erro
 			defer c.vfs.Release(c.auth, ino, cfh)
 
 			n, rErr := c.vfs.Read(c.auth, ino, buf, offset, cfh)
+			if rErr == 0 || rErr == syscall.Errno(0) {
+				if bar != nil {
+					bar.IncrBy(int(n))
+				}
+			}
 			if rErr != 0 && rErr != syscall.Errno(0) {
 				errMu.Lock()
 				if firstErr == nil {
@@ -585,6 +649,10 @@ func (c *MBoxClient) exportFile(ino vfs.Ino, localPath string, size uint64) erro
 		}(off)
 	}
 	wg.Wait()
+
+	if firstErr != nil && bar != nil {
+		bar.Abort(true)
+	}
 
 	return firstErr
 }

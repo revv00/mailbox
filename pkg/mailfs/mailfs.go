@@ -861,7 +861,7 @@ func (m *MailFS) storeWithRetry(initialIdx int, otherIdx int, key string, data [
 		return initialIdx, msgID, nil
 	}
 
-	logger.Warnf("Failed to store in primary account %d (%s) for key %s: %v. Trying alternative accounts...",
+	logger.Infof("Failed to store in primary account %d (%s) for key %s: %v. Trying alternative accounts...",
 		initialIdx, m.accounts[initialIdx].Email, key, err)
 
 	// Find alternatives
@@ -912,7 +912,7 @@ func (m *MailFS) storeWithRetry(initialIdx int, otherIdx int, key string, data [
 				altIdx, m.accounts[altIdx].Email, key)
 			return altIdx, mid, nil
 		}
-		logger.Warnf("Failed to store in alternative account %d (%s) for key %s: %v",
+		logger.Infof("Failed to store in alternative account %d (%s) for key %s: %v",
 			altIdx, m.accounts[altIdx].Email, key, err)
 		lastErr = err
 	}
@@ -1183,7 +1183,7 @@ func (m *MailFS) getSMTPClient(accountIdx int) (*safeSMTPClient, error) {
 		// Fallback to LOGIN mechanism if PLAIN fails (required for Outlook)
 		// Important: If Auth fails, the connection might be closed by the server (seen with Outlook).
 		// We must Close() the old connection and Reconnect before retrying.
-		logger.Warnf("[Acc: %s] PlainAuth failed: %v. Reconnecting to retry with LOGIN auth...", acc.Email, err)
+		logger.Infof("[Acc: %s] PlainAuth failed: %v. Reconnecting to retry with LOGIN auth...", acc.Email, err)
 
 		_ = c.Close() // Close the broken connection
 
@@ -1295,7 +1295,7 @@ func (m *MailFS) storeInEmail(accountIdx int, key string, data []byte) (string, 
 			// Some servers take a few seconds to populate the Sent folder
 			time.Sleep(5 * time.Second)
 			if err := m.deleteSentMessage(accountIdx, msgID); err != nil {
-				logger.Warnf("Failed to remove sent email %s: %v", msgID, err)
+				logger.Infof("Failed to remove sent email %s: %v", msgID, err)
 			}
 		}()
 	}
@@ -1403,7 +1403,7 @@ func (m *MailFS) storeGenericFile(subject string, filename string, data []byte) 
 			// Some servers take a few seconds to populate the Sent folder
 			time.Sleep(5 * time.Second)
 			if err := m.deleteSentMessage(accountIdx, msgID); err != nil {
-				logger.Warnf("Failed to remove sent mbox config %s: %v", msgID, err)
+				logger.Infof("Failed to remove sent mbox config %s: %v", msgID, err)
 			}
 		}()
 	}
@@ -1751,7 +1751,7 @@ func (m *MailFS) findMsgUID(c *client.Client, key string, isBlob bool) (uint32, 
 	// 2. Try Raw Server-Side Search
 	ids, err := m.rawSearchSubject(c, expectedSubject)
 	if err != nil {
-		logger.Warnf("Raw search failed: %v", err)
+		logger.Infof("Raw search failed: %v", err)
 	}
 
 	// 3. Fallback for blobs: Search for broad terms if specific key search failed
@@ -2034,7 +2034,7 @@ func (m *MailFS) findMsgByMessageID(c *client.Client, folder string, msgID strin
 	}
 	status, err := c.Execute(cmd, handler)
 	if err != nil || status.Type != "OK" {
-		logger.Warnf("[IMAP] raw SEARCH for Message-ID %s in %s failed: %v", msgID, folder, err)
+		logger.Infof("[IMAP] raw SEARCH for Message-ID %s in %s failed: %v", msgID, folder, err)
 	}
 
 	// 2. Fallback: Search for recent messages if specific msgID search failed
@@ -2169,7 +2169,7 @@ func (m *MailFS) deleteSentMessage(accountIdx int, messageID string) error {
 	}
 
 	if uid == 0 {
-		logger.Warnf("[IMAP] Sent message %s not found in folder %s after retries", messageID, sentFolder)
+		logger.Infof("[IMAP] Sent message %s not found in folder %s after retries", messageID, sentFolder)
 		return nil
 	}
 
