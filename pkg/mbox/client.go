@@ -133,7 +133,7 @@ func NewMBoxClient(dbPath string, conf *config.ParsedConfig, noCache bool, paral
 		Compress:   "lz4",
 		MaxUpload:  parallel,
 		MaxRetries: 10,
-		BufferSize: 300 << 20,
+		BufferSize: uint64(parallel+1) * 16 * 1024 * 1024, // Tightly couple buffer to network speed
 		GetTimeout: putTimeout,
 		PutTimeout: putTimeout,
 		Writeback:  false,
@@ -400,10 +400,7 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 		return fmt.Errorf("create %s failed: %v", vPath, errno)
 	}
 
-	const vfsWriteSize = 64 * 1024 * 1024 // Step by JuiceFS chunk size for optimal parallel chunking
-	var wg sync.WaitGroup
-	var errMu sync.Mutex
-	var firstErr error
+	const vfsWriteSize = 16 * 1024 * 1024 // Step by JuiceFS block size for smooth progress
 
 	var bar *mpb.Bar
 	if !strings.HasPrefix(filepath.Base(localPath), ".") && size > 0 {
@@ -420,78 +417,61 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 	}
 
 	for off := int64(0); off < size; off += vfsWriteSize {
-		wg.Add(1)
-		go func(offset int64) {
-			defer wg.Done()
-
-			c.sem <- struct{}{}
-			defer func() { <-c.sem }()
-
-			select {
-			case <-c.ctx.Done():
-				return
-			default:
+		select {
+		case <-c.ctx.Done():
+			if bar != nil {
+				bar.Abort(true)
 			}
-
-			errMu.Lock()
-			if firstErr != nil || c.ctx.Err() != nil {
-				errMu.Unlock()
-				return
-			}
-			errMu.Unlock()
-
-			thisSize := int64(vfsWriteSize)
-			if offset+thisSize > size {
-				thisSize = size - offset
-			}
-
-			buf := make([]byte, thisSize)
-			n, rErr := f.ReadAt(buf, offset)
-			if rErr != nil && rErr != io.EOF {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("read %s at %d failed: %v", localPath, offset, rErr)
-				}
-				errMu.Unlock()
-				return
-			}
-
-			if n > 0 {
-				if failAfter := os.Getenv("MBOX_TEST_FAIL_AFTER"); failAfter != "" {
-					var failOffset int64
-					fmt.Sscanf(failAfter, "%d", &failOffset)
-					if offset >= failOffset {
-						panic("simulated failure")
-					}
-				}
-				wErr := c.vfs.Write(c.auth, entry.Inode, buf[:n], uint64(offset), fh)
-				if wErr == 0 {
-					if bar != nil {
-						bar.IncrBy(n)
-					}
-				}
-				if wErr != 0 {
-					errMu.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("write %s at %d failed: %v", vPath, offset, wErr)
-					}
-					errMu.Unlock()
-				}
-			}
-		}(off)
-	}
-	wg.Wait()
-
-	if firstErr == nil && c.ctx.Err() != nil {
-		firstErr = c.ctx.Err()
-	}
-
-	if firstErr != nil {
-		if bar != nil {
-			bar.Abort(true)
+			c.vfs.Release(c.auth, entry.Inode, fh)
+			return c.ctx.Err()
+		default:
 		}
-		c.vfs.Release(c.auth, entry.Inode, fh)
-		return firstErr
+
+		thisSize := int64(vfsWriteSize)
+		if off+thisSize > size {
+			thisSize = size - off
+		}
+
+		// If this entire block was already fully committed in a previous run, skip reading/writing it.
+		// This prevents generating new slice versions (e.g. _2), keeping deduplication perfect.
+		if off+thisSize <= int64(entry.Attr.Length) {
+			if bar != nil {
+				bar.IncrBy(int(thisSize))
+			}
+			continue
+		}
+
+		buf := make([]byte, thisSize)
+		n, rErr := f.ReadAt(buf, off)
+		if rErr != nil && rErr != io.EOF {
+			if bar != nil {
+				bar.Abort(true)
+			}
+			c.vfs.Release(c.auth, entry.Inode, fh)
+			return fmt.Errorf("read %s at %d failed: %v", localPath, off, rErr)
+		}
+
+		if n > 0 {
+			if failAfter := os.Getenv("MBOX_TEST_FAIL_AFTER"); failAfter != "" {
+				var failOffset int64
+				fmt.Sscanf(failAfter, "%d", &failOffset)
+				if off >= failOffset {
+					panic("simulated failure")
+				}
+			}
+			wErr := c.vfs.Write(c.auth, entry.Inode, buf[:n], uint64(off), fh)
+			if wErr == 0 {
+				if bar != nil {
+					bar.IncrBy(n)
+				}
+			} else {
+				if bar != nil {
+					bar.Abort(true)
+				}
+				c.vfs.Release(c.auth, entry.Inode, fh)
+				return fmt.Errorf("write %s at %d failed: %v", vPath, off, wErr)
+			}
+		}
 	}
 
 	// Ensure buffers are flushed and handle is released

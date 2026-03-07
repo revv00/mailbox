@@ -2358,7 +2358,7 @@ func (m *MailFS) BatchDelete(keys []string) error {
 			continue
 		}
 
-		_ = func() error {
+		err := func() error {
 			safeClient, err := m.getIMAPClient(accIdx)
 			if err != nil {
 				return err
@@ -2409,6 +2409,9 @@ func (m *MailFS) BatchDelete(keys []string) error {
 			}
 			return nil
 		}()
+		if err != nil {
+			fmt.Printf("⚠️  Warning: Error during batch delete on %s: %v\n", m.accounts[accIdx].Email, err)
+		}
 	}
 
 	// 4. Cleanup local DB
