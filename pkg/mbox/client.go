@@ -21,6 +21,7 @@ import (
 	"github.com/revv00/mailfs/pkg/mailfs"
 	"github.com/vbauerster/mpb/v7"
 	"github.com/vbauerster/mpb/v7/decor"
+	"golang.org/x/term"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -46,9 +47,12 @@ func (c *DummyContext) WithValue(k, v interface{}) meta.Context {
 	return c
 }
 
-func NewContext() vfs.LogContext {
+func NewContext(ctx context.Context) vfs.LogContext {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &DummyContext{
-		Context: context.Background(),
+		Context: ctx,
 		UidVal:  0,
 		GidVal:  0,
 		PidVal:  uint32(os.Getpid()),
@@ -74,6 +78,8 @@ type MBoxClient struct {
 	parallel int
 	sem      chan struct{}
 	progress *mpb.Progress
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 func NewMBoxClient(dbPath string, conf *config.ParsedConfig, noCache bool, parallel int, putTimeout time.Duration) (*MBoxClient, error) {
@@ -143,14 +149,23 @@ func NewMBoxClient(dbPath string, conf *config.ParsedConfig, noCache bool, paral
 		},
 	}, m, store, nil, nil)
 
+	ctx, cancel := context.WithCancel(context.Background())
+
+	mpbOpts := []mpb.ContainerOption{mpb.WithWidth(64)}
+	if !term.IsTerminal(int(os.Stdout.Fd())) || os.Getenv("CI") != "" {
+		mpbOpts = append(mpbOpts, mpb.WithOutput(io.Discard))
+	}
+
 	return &MBoxClient{
 		vfs:      v,
 		meta:     m,
-		auth:     NewContext(),
+		auth:     NewContext(context.Background()),
 		blob:     blob,
 		parallel: parallel,
 		sem:      make(chan struct{}, parallel),
-		progress: mpb.New(mpb.WithWidth(64)),
+		progress: mpb.New(mpbOpts...),
+		ctx:      ctx,
+		cancel:   cancel,
 	}, nil
 }
 
@@ -184,6 +199,7 @@ func (c *MBoxClient) CloseDB() error {
 }
 
 func (c *MBoxClient) Close() error {
+	c.cancel() // Cancel any ongoing operations
 	c.progress.Wait()
 	err1 := c.CloseFS()
 	err2 := c.blob.Close()
@@ -262,11 +278,20 @@ func (c *MBoxClient) Import(localPath string, virtualPath string) error {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for j := range jobs {
-					if err := c.importFile(j.path, j.vPath); err != nil {
-						select {
-						case results <- err:
-						default:
+				for {
+					select {
+					case <-c.ctx.Done():
+						return
+					case j, ok := <-jobs:
+						if !ok {
+							return
+						}
+						if err := c.importFile(j.path, j.vPath); err != nil {
+							c.cancel() // Stop all other workers
+							select {
+							case results <- err:
+							default:
+							}
 						}
 					}
 				}
@@ -276,6 +301,11 @@ func (c *MBoxClient) Import(localPath string, virtualPath string) error {
 		walkErr := filepath.Walk(localPath, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
+			}
+			select {
+			case <-c.ctx.Done():
+				return context.Canceled
+			default:
 			}
 			rel, _ := filepath.Rel(localPath, path)
 			if rel == "." {
@@ -289,6 +319,8 @@ func (c *MBoxClient) Import(localPath string, virtualPath string) error {
 
 			select {
 			case jobs <- job{path, vPath}:
+			case <-c.ctx.Done():
+				return context.Canceled
 			case err := <-results:
 				return err
 			}
@@ -304,6 +336,8 @@ func (c *MBoxClient) Import(localPath string, virtualPath string) error {
 		select {
 		case err := <-results:
 			return err
+		case <-c.ctx.Done():
+			return c.ctx.Err()
 		default:
 			return nil
 		}
@@ -393,8 +427,14 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 			c.sem <- struct{}{}
 			defer func() { <-c.sem }()
 
+			select {
+			case <-c.ctx.Done():
+				return
+			default:
+			}
+
 			errMu.Lock()
-			if firstErr != nil {
+			if firstErr != nil || c.ctx.Err() != nil {
 				errMu.Unlock()
 				return
 			}
@@ -442,6 +482,10 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 	}
 	wg.Wait()
 
+	if firstErr == nil && c.ctx.Err() != nil {
+		firstErr = c.ctx.Err()
+	}
+
 	if firstErr != nil {
 		if bar != nil {
 			bar.Abort(true)
@@ -451,7 +495,7 @@ func (c *MBoxClient) importFile(localPath, vPath string) error {
 	}
 
 	// Ensure buffers are flushed and handle is released
-	c.vfs.Flush(c.auth, entry.Inode, 0, fh)
+	_ = c.vfs.Flush(c.auth, entry.Inode, 0, fh)
 	c.vfs.Release(c.auth, entry.Inode, fh)
 
 	// Update metadata final size
