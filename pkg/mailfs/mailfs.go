@@ -40,6 +40,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/utils"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/revv00/mailfs/pkg/config"
+	"github.com/sirupsen/logrus"
 )
 
 var logger = utils.GetLogger("mailfs")
@@ -144,6 +145,26 @@ func init() {
 
 		return NewMailFS(cfg)
 	})
+}
+
+func init() {
+	level := os.Getenv("MAILFS_LOG_LEVEL")
+	if level == "" {
+		utils.SetLogLevel(logrus.WarnLevel)
+		return
+	}
+	switch strings.ToLower(level) {
+	case "debug":
+		utils.SetLogLevel(logrus.DebugLevel)
+	case "info":
+		utils.SetLogLevel(logrus.InfoLevel)
+	case "warn", "warning":
+		utils.SetLogLevel(logrus.WarnLevel)
+	case "error":
+		utils.SetLogLevel(logrus.ErrorLevel)
+	default:
+		utils.SetLogLevel(logrus.WarnLevel)
+	}
 }
 
 func (c *imapIDCommand) Command() *imap.Command {
@@ -251,7 +272,7 @@ func NewMailFS(cfg config.MailFSConfig) (*MailFS, error) {
 	// This ensures commands like `mbox ls` only connect to the first account,
 	// and speeds up startup for all commands.
 	// if err := mfs.initIMAPConnections(); err != nil {
-	// 	logger.Warnf("Issues initializing IMAP connections: %v", err)
+	// 	logger.Infof("Issues initializing IMAP connections: %v", err)
 	// }
 
 	logger.Infof("MailFS initialized with %d email accounts", len(mfs.config.Accounts))
@@ -312,7 +333,7 @@ func (m *MailFS) initIMAPConnections() error {
 			defer wg.Done()
 			c, err := m.connectIMAP(acc)
 			if err != nil {
-				logger.Warnf("Issues initializing IMAP connection for %s: %v", acc.Email, err)
+				logger.Infof("Issues initializing IMAP connection for %s: %v", acc.Email, err)
 				return
 			}
 			// Safe to assign without lock here as NewMailFS is single-threaded initialization
@@ -439,7 +460,7 @@ func (m *MailFS) getIMAPClient(accountIdx int) (*safeIMAPClient, error) {
 		if err := sc.c.Noop(); err == nil {
 			return sc, nil
 		}
-		logger.Warnf("[IMAP] Connection lost for account %d, reconnecting...", accountIdx)
+		logger.Infof("[IMAP] Connection lost for account %d, reconnecting...", accountIdx)
 		// Connection lost, close explicitly
 		_ = sc.c.Logout()
 		sc.c = nil
@@ -563,7 +584,7 @@ func (m *MailFS) findBlobInCloud(accountIdx int, key string) (string, error) {
 		results = append(results, msg)
 	}
 	if err := <-done; err != nil {
-		logger.Warnf("Candidate fetch failed for key %s: %v", key, err)
+		logger.Infof("Candidate fetch failed for key %s: %v", key, err)
 	}
 
 	expectedSubject := m.config.SubjectPrefix + key
@@ -703,7 +724,7 @@ func (m *MailFS) Get(key string, off, limit int64, getters ...object.AttrGetter)
 	if err != nil {
 		if replicaIdx.Valid {
 			repIdx := int(replicaIdx.Int64)
-			logger.Warnf("Primary fetch failed for %s (acc %d), trying replica (acc %d): %v", key, primaryIdx, repIdx, err)
+			logger.Infof("Primary fetch failed for %s (acc %d), trying replica (acc %d): %v", key, primaryIdx, repIdx, err)
 			unlockRep := m.lockAccounts(repIdx)
 			data, err = m.fetchFromEmail(repIdx, replicaMsgID.String, searchKey)
 			unlockRep()
@@ -741,7 +762,7 @@ func (m *MailFS) Get(key string, off, limit int64, getters ...object.AttrGetter)
 		now := time.Now().UnixNano()
 		_, dbErr := m.db.Exec(`INSERT OR REPLACE INTO blob_data (key, data) VALUES (?, ?)`, key, data)
 		if dbErr != nil {
-			logger.Warnf("Failed to update blob_data cache for %s: %v", key, dbErr)
+			logger.Infof("Failed to update blob_data cache for %s: %v", key, dbErr)
 		}
 
 		// Ensure metadata exists
@@ -749,7 +770,7 @@ func (m *MailFS) Get(key string, off, limit int64, getters ...object.AttrGetter)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			key, int64(len(data)), now, primaryIdx, replicaIdx, primaryMsgID, replicaMsgID, now)
 		if dbErr != nil {
-			logger.Warnf("Failed to update blobs metadata for %s: %v", key, dbErr)
+			logger.Infof("Failed to update blobs metadata for %s: %v", key, dbErr)
 		}
 	}
 	m.Unlock()
@@ -1008,7 +1029,7 @@ func (m *MailFS) Put(key string, in io.Reader, getters ...object.AttrGetter) err
 		return fmt.Errorf("failed to store primary replica: %w", pErr)
 	}
 	if rErr != nil {
-		logger.Warnf("Replica upload failed for %s: %v", key, rErr)
+		logger.Infof("Replica upload failed for %s: %v", key, rErr)
 	}
 
 	// 3. Update Database (Metadata + Hot Cache)

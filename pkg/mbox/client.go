@@ -64,7 +64,7 @@ func NewMBoxClient(dbPath string, conf *config.ParsedConfig, noCache bool, paral
 		parallel = 1
 	}
 	if putTimeout <= 0 {
-		putTimeout = 10 * time.Minute
+		putTimeout = 60 * time.Minute
 	}
 	cfg := config.MailFSConfig{
 		Accounts:           conf.Accounts,
