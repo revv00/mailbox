@@ -5,7 +5,7 @@ A portable, secure, and extremely simple CLI tool to turn your email accounts in
 ---
 
 ## 🛠 Installation
-- Option 1: Download from [Releases](https://github.com/revv00/mailfs/releases).
+- Option 1: Download from [Releases](https://github.com/revv00/mailbox/releases).
 - Option 2: If you have Go installed:
 ```bash
 go install github.com/revv00/mailfs/cmd/mbox@latest
@@ -18,9 +18,9 @@ make       # Standard build (stripped, ~74MB)
 make lite  # Optimized lite build (removes unused cloud drivers, ~25MB)
 make clean # Remove built binaries
 ```
-The `mbox.lite` version is recommended for maximum portability as it removes heavy cloud SDKs (S3, GCS, Azure, etc.) while keeping full support for Email-based storage.
+The `mbox` (lite) version is recommended for maximum portability as it removes heavy cloud SDKs (S3, GCS, Azure, etc.) while keeping full support for Email-based storage.
 
-For others, download the latest pre-built binary for your platform (Linux, macOS, Windows) from the [Releases](https://github.com/revv00/mailfs/releases) page.
+For others, download the latest pre-built binary for your platform (Linux, macOS, Windows) from the [Releases](https://github.com/revv00/mailbox/releases) page.
 
 ---
 

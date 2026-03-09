@@ -37,7 +37,7 @@ mbox:
 	go build -ldflags="$(LDFLAGS)" -o $(BINARY) ./cmd/mbox
 
 lite:
-	go build -tags $(LITE_TAGS) -ldflags="$(LDFLAGS)" -o $(BINARY).lite ./cmd/mbox
+	go build -tags $(LITE_TAGS) -ldflags="$(LDFLAGS)" -o $(BINARY) ./cmd/mbox
 
 # Docker-based cross-compilation (Lite versions)
 docker-lite-linux:
@@ -55,7 +55,7 @@ docker-lite-windows-amd64:
 docker-lite-all: docker-lite-linux docker-lite-darwin-amd64 docker-lite-darwin-arm64 docker-lite-windows-amd64
 
 clean:
-	rm -f $(BINARY) $(BINARY).lite *.exe $(BINARY)-linux-amd64 $(BINARY)-darwin-amd64 $(BINARY)-darwin-arm64
+	rm -f $(BINARY) *.exe $(BINARY)-linux-amd64 $(BINARY)-darwin-amd64 $(BINARY)-darwin-arm64
 
 test-single:
 	./run_test_single.sh

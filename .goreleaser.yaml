@@ -7,7 +7,7 @@ before:
 builds:
   - id: mbox-lite-linux-amd64
     main: ./cmd/mbox
-    binary: mbox-lite
+    binary: mbox
     env:
       - CGO_ENABLED=1
     goos:
@@ -21,7 +21,7 @@ builds:
 
   - id: mbox-lite-linux-arm64
     main: ./cmd/mbox
-    binary: mbox-lite
+    binary: mbox
     env:
       - CGO_ENABLED=1
       - CC=aarch64-linux-gnu-gcc
@@ -34,7 +34,7 @@ builds:
 
   - id: mbox-lite-windows-amd64
     main: ./cmd/mbox
-    binary: mbox-lite
+    binary: mbox
     env:
       - CGO_ENABLED=1
       - CC=x86_64-w64-mingw32-gcc
@@ -48,7 +48,7 @@ builds:
 
   - id: mbox-lite-darwin-amd64
     main: ./cmd/mbox
-    binary: mbox-lite
+    binary: mbox
     env:
       - CGO_ENABLED=1
       - CC=o64-clang
@@ -61,7 +61,7 @@ builds:
 
   - id: mbox-lite-darwin-arm64
     main: ./cmd/mbox
-    binary: mbox-lite
+    binary: mbox
     env:
       - CGO_ENABLED=1
       - CC=oa64-clang
