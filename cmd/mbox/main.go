@@ -110,7 +110,7 @@ func main() {
 						var err error
 						if isEnc {
 							// For config command, we handle password prompt manually if name is custom
-							masterPwd, err := getMasterPassword(c)
+							masterPwd, err := getMasterPassword(c, cfgPath)
 							if err != nil {
 								return err
 							}
@@ -175,7 +175,7 @@ func main() {
 					if isNew {
 						masterPwd, err = getNewMasterPassword(c)
 					} else {
-						masterPwd, err = getMasterPassword(c)
+						masterPwd, err = getMasterPassword(c, cfgPath)
 					}
 					if err != nil {
 						return err
@@ -186,6 +186,7 @@ func main() {
 						return err
 					}
 
+					updateSessionMasterPassword(cfgPath, masterPwd)
 					fmt.Printf("Success! Configuration encrypted and saved at %s\n", cfgPath)
 					return nil
 				},
@@ -326,9 +327,14 @@ func listConfigs() []string {
 	return names
 }
 
-func getMasterPassword(c *cli.Context) (string, error) {
+func getMasterPassword(c *cli.Context, cfgPath string) (string, error) {
 	if p := os.Getenv("MBOX_MASTER_PASSWORD"); p != "" {
 		return p, nil
+	}
+	if cfgPath != "" {
+		if s := loadSession(cfgPath); s != nil && s.MasterPassword != "" {
+			return s.MasterPassword, nil
+		}
 	}
 	fmt.Print("Enter Master Password: ")
 	bytePassword, err := term.ReadPassword(int(os.Stdin.Fd()))
@@ -434,7 +440,7 @@ func getCacheDir(target string) string {
 	return dir
 }
 
-func getArchivePassword(c *cli.Context, confirm bool, fallback string) (string, error) {
+func getArchivePassword(c *cli.Context, confirm bool, fallback string, cfgPath string) (string, error) {
 	p := c.String("password")
 	if p == "" {
 		// Fallback: check c.Args() for trailing -p or --password
@@ -461,6 +467,11 @@ func getArchivePassword(c *cli.Context, confirm bool, fallback string) (string, 
 	if p := os.Getenv("MBOX_ARCHIVE_PASSWORD"); p != "" {
 		return p, nil
 	}
+	if cfgPath != "" {
+		if s := loadSession(cfgPath); s != nil && s.ArchivePassword != "" {
+			return s.ArchivePassword, nil
+		}
+	}
 	fmt.Print("Enter Archive Password (leave empty to use Master Password): ")
 	bytePassword, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Println()
@@ -472,12 +483,16 @@ func getArchivePassword(c *cli.Context, confirm bool, fallback string) (string, 
 	if pwd == "" {
 		if fallback != "" {
 			fmt.Println("Using Master Password.")
+			// If we use the fallback, we don't return it as an *Archive Password* to be cached.
+			// The caller can just use it. We return it, but maybe we shouldn't cache it as archive.
+			// Actually, let's return a special flag, or just let the caller cache it.
+			// If we cache Master as Archive, it's fine. It just means for 1 hour, Archive = Master.
 			return fallback, nil
 		}
 		// If no fallback provided (or unencrypted config), try to request Master Password
 		// This ensures we always have *some* security or link to identity.
 		fmt.Println("Using Master Password.")
-		return getMasterPassword(c)
+		return getMasterPassword(c, cfgPath)
 	}
 
 	if confirm {
@@ -578,25 +593,30 @@ func getRemoveSent(c *cli.Context) bool {
 	return val
 }
 
-func loadGlobalAccounts(c *cli.Context) (*config.ParsedConfig, string, error) {
+func loadGlobalAccounts(c *cli.Context) (*config.ParsedConfig, string, string, error) {
 	cfgPath := getConfigPath(getAccount(c))
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-		return nil, "", fmt.Errorf("configuration file not found at %s. Run 'mbox config' first", cfgPath)
+		return nil, "", "", fmt.Errorf("configuration file not found at %s. Run 'mbox config' first", cfgPath)
 	}
 
 	isEnc, err := config.IsEncrypted(cfgPath)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 
 	var cfg *config.ParsedConfig
 	var pwd string
 	if isEnc {
-		pwd, err = getMasterPassword(c)
+		pwd, err = getMasterPassword(c, cfgPath)
 		if err != nil {
-			return nil, "", err
+			return nil, "", "", err
 		}
 		cfg, err = config.LoadAccountsFromEncryptedJSON(cfgPath, pwd)
+		if err != nil {
+			clearSession(cfgPath) // Clear session if decryption failed
+			return nil, "", "", err
+		}
+		updateSessionMasterPassword(cfgPath, pwd)
 	} else {
 		fmt.Println("⚠️ Warning: Using unencrypted config file. Run 'mbox config' to encrypt it.")
 		cfg, err = config.LoadAccountsFromJSON(cfgPath)
@@ -606,7 +626,7 @@ func loadGlobalAccounts(c *cli.Context) (*config.ParsedConfig, string, error) {
 		cfg.ParallelByProvider = getParallelByProvider(c)
 		cfg.RemoveSent = getRemoveSent(c)
 	}
-	return cfg, pwd, err
+	return cfg, pwd, cfgPath, err
 }
 
 func doPut(c *cli.Context, repl int) error {
@@ -617,16 +637,17 @@ func doPut(c *cli.Context, repl int) error {
 
 	// 1. Load Global Config
 	fmt.Println("[1/2] Unlock Identity")
-	parsed, masterPwd, err := loadGlobalAccounts(c)
+	parsed, masterPwd, cfgPath, err := loadGlobalAccounts(c)
 	if err != nil {
 		return err
 	}
 
 	fmt.Println("[2/2] Encrypt Archive")
-	archivePwd, err := getArchivePassword(c, true, masterPwd)
+	archivePwd, err := getArchivePassword(c, true, masterPwd, cfgPath)
 	if err != nil {
 		return err
 	}
+	updateSessionArchivePassword(cfgPath, archivePwd)
 
 	// Override replication factor if specified by command (stash=1, put=2)
 	if repl > 0 {
@@ -718,13 +739,17 @@ func doGet(c *cli.Context) error {
 	}
 	targetArg := c.Args().First()
 	stickFile := targetArg
+	var masterPwd string
+	cfgPath := getConfigPath(getAccount(c))
 
 	// 0. Check if local, otherwise try cloud
 	if _, err := os.Stat(stickFile); os.IsNotExist(err) {
 		fmt.Printf("Local file %s not found, searching cloud...\n", stickFile)
 
-		parsed, _, err := loadGlobalAccounts(c)
+		var masterPwd_ string
+		parsed, masterPwd_, _, err := loadGlobalAccounts(c)
 		if err == nil {
+			masterPwd = masterPwd_
 			tmpDir, _ := os.MkdirTemp("", "mbox-search-*")
 			defer os.RemoveAll(tmpDir)
 
@@ -764,10 +789,11 @@ func doGet(c *cli.Context) error {
 		return nil
 	}
 
-	archivePwd, err := getArchivePassword(c, false, "")
+	archivePwd, err := getArchivePassword(c, false, masterPwd, cfgPath)
 	if err != nil {
 		return err
 	}
+	updateSessionArchivePassword(cfgPath, archivePwd)
 
 	// 1. Unpack
 	tmpDir, err := os.MkdirTemp("", "mbox-get-*")
@@ -842,7 +868,7 @@ func doDelete(c *cli.Context) error {
 		isLocal = false
 		fmt.Printf("Local file %s not found, searching cloud...\n", targetArg)
 
-		parsed, _, err := loadGlobalAccounts(c)
+		parsed, _, _, err := loadGlobalAccounts(c)
 		if err != nil {
 			return fmt.Errorf("failed to load global config for search: %w", err)
 		}
@@ -892,7 +918,8 @@ func doDelete(c *cli.Context) error {
 
 	// 3. Authenticate for Unpacking
 	fmt.Println("Enter Password to decrypt the stick(s):")
-	archivePwd, err := getArchivePassword(c, false, "")
+	cfgPath := getConfigPath(getAccount(c))
+	archivePwd, err := getArchivePassword(c, false, "", cfgPath)
 	if err != nil {
 		return err
 	}
@@ -903,7 +930,7 @@ func doDelete(c *cli.Context) error {
 		stickFile := targetName
 
 		// Load global config for each to ensure fresh state (though we could optimize, this is safer)
-		parsedGlobal, _, err := loadGlobalAccounts(c)
+		parsedGlobal, _, _, err := loadGlobalAccounts(c)
 		if err != nil {
 			fmt.Printf("Error: failed to load global config: %v\n", err)
 			continue
@@ -930,9 +957,11 @@ func doDelete(c *cli.Context) error {
 		// 5. Unpack to get Blob keys
 		fmt.Printf("Unpacking stick metadata...\n")
 		if err := mbox.Unpack(archivePwd, stickFile, unpackDir); err != nil {
+			clearSession(cfgPath)
 			fmt.Printf("Error: unpack failed for %s: %v (Check password?)\n", targetName, err)
 			continue
 		}
+		updateSessionArchivePassword(cfgPath, archivePwd)
 
 		// 6. Init Client from Stick Config
 		innerCfgPath := filepath.Join(unpackDir, "config.json")
@@ -986,7 +1015,7 @@ func doDelete(c *cli.Context) error {
 
 func doLs(c *cli.Context) error {
 	// Load accounts (decrypted if necessary)
-	parsed, _, err := loadGlobalAccounts(c)
+	parsed, _, _, err := loadGlobalAccounts(c)
 	if err != nil {
 		return err
 	}
@@ -1039,7 +1068,7 @@ func doWipe(c *cli.Context) error {
 	}
 
 	// 2. Load Global Config
-	parsed, _, err := loadGlobalAccounts(c)
+	parsed, _, _, err := loadGlobalAccounts(c)
 	if err != nil {
 		return err
 	}
@@ -1098,7 +1127,8 @@ func doInfo(c *cli.Context) error {
 	stickFile := c.Args().Get(0)
 	vPath := c.Args().Get(1)
 
-	archivePwd, err := getArchivePassword(c, false, "")
+	cfgPath := getConfigPath(getAccount(c))
+	archivePwd, err := getArchivePassword(c, false, "", cfgPath)
 	if err != nil {
 		return err
 	}
@@ -1111,8 +1141,10 @@ func doInfo(c *cli.Context) error {
 	defer os.RemoveAll(tmpDir)
 
 	if err := mbox.Unpack(archivePwd, stickFile, tmpDir); err != nil {
+		clearSession(cfgPath)
 		return fmt.Errorf("unpack failed: %w", err)
 	}
+	updateSessionArchivePassword(cfgPath, archivePwd)
 
 	// 2. Load Config from Stick
 	innerCfgPath := filepath.Join(tmpDir, "config.json")

@@ -61,13 +61,13 @@ func TestLoadAccountsFromJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to load object config: %v", err)
 	}
-	if len(accounts) != 1 {
-		t.Fatalf("Expected 1 account, got %d", len(accounts))
+	if len(accounts.Accounts) != 1 {
+		t.Fatalf("Expected 1 account, got %d", len(accounts.Accounts))
 	}
-	if accounts[0].Email != "test2@example.com" {
-		t.Errorf("Expected email test2@example.com, got %s", accounts[0].Email)
+	if accounts.Accounts[0].Email != "test2@example.com" {
+		t.Errorf("Expected email test2@example.com, got %s", accounts.Accounts[0].Email)
 	}
-	if accounts[0].IMAPHost != "imap.test2.com:993" {
-		t.Errorf("Expected IMAP host imap.test2.com:993, got %s", accounts[0].IMAPHost)
+	if accounts.Accounts[0].IMAPHost != "imap.test2.com:993" {
+		t.Errorf("Expected IMAP host imap.test2.com:993, got %s", accounts.Accounts[0].IMAPHost)
 	}
 }
